@@ -31,6 +31,7 @@ const ENTRIES: &[&str] = &[
     "bokeh_prefix",
     "bokeh_gather",
     "fill",
+    "premultiply8",
 ];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
@@ -269,6 +270,8 @@ pub struct GpuContext {
     pub(crate) deferred: Option<Arc<crate::deferred::Deferred>>,
     /// Plug-in kernels compiled for this device (built on first use).
     pub(crate) plugin_kernels: crate::fx_plugin::Kernels,
+    /// Shape layers on the GPU: the vello renderer and processed layers (`vector`).
+    pub(crate) vector: crate::vector::State,
 }
 
 pub(crate) fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -495,6 +498,7 @@ impl GpuContext {
             particle_states: Default::default(),
             deferred: None,
             plugin_kernels: Default::default(),
+            vector: Default::default(),
         })
     }
 
@@ -614,6 +618,12 @@ impl GpuContext {
         }
     }
 
+    /// Shape layer sources rasterised on the GPU so far (layers served from the GPU's cache of
+    /// processed shape layers are not counted again).
+    pub fn shape_layers_drawn(&self) -> u64 {
+        self.vector.drawn.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Texture pool counters: (working textures reused, newly allocated).
     pub fn pool_stats(&self) -> (u64, u64) {
         self.pool.lock().map(|p| (p.hits, p.misses)).unwrap_or_default()
@@ -688,6 +698,7 @@ impl GpuContext {
         if let Ok(mut s) = self.staging.lock() {
             s.clear();
         }
+        self.vector.clear();
     }
 }
 

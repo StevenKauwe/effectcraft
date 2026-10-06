@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
-use effectcraft_project::{ItemId, Layer, Quality};
+use effectcraft_project::{ItemId, Layer, LayerSource, Quality};
 use effectcraft_raster::Image;
-use effectcraft_render::{EvalCtx, Renderer, styles};
+use effectcraft_render::{EvalCtx, Placement, Renderer, styles};
 use effectcraft_time::Tick;
 
 use crate::context::{Enc, GpuImage};
@@ -214,6 +214,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if opacity <= 0.0 {
         return Some(());
     }
+    if draw_shape_layer(e, r, ctx, layer, canvas, opacity).is_some() {
+        return Some(());
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -241,6 +244,44 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     tmp = place(e, r, ctx, layer, &st.body, &tmp, layer.blend_mode, 1.0, None)?;
     *canvas = ops::channel_mix(e, canvas, &tmp, bl.channels, opacity);
     Some(())
+}
+
+/// A plain shape layer (no layer styles, track matte or Preserve Transparency) without leaving
+/// the GPU: its source rasterised here (`vector`), its effects run on the device, the result
+/// placed as `place` places a layer buffer. `None` = not handled (nothing was drawn); the
+/// layer then takes the CPU layer-buffer path.
+fn draw_shape_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<()> {
+    if !matches!(layer.source, LayerSource::Shape) || styles::active(ctx, layer) || r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
+        return None;
+    }
+    let (mut img, offset, scale) = shape_content(e, r, ctx, layer)?;
+    if let Some(c) = r.pipe().to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
+    // Placement reads only the buffer's size, offset and scale: an image without pixels.
+    let shell = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    let pl = r.placement(ctx, layer, &shell);
+    *canvas = place_image(e, &img, &pl, canvas, layer.blend_mode, opacity, r.pipe().levels);
+    Some(())
+}
+
+/// A shape layer's processed pixels on the GPU (source → effects), from the vector cache when
+/// its content key matches.
+fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<crate::vector::Content> {
+    let key = r.content_key_of(ctx, layer);
+    if let Some(hit) = key.and_then(|k| e.g.vector.get(k)) {
+        return Some(hit);
+    }
+    let scene = r.shape_scene(ctx, layer)?;
+    let levels = r.pipe().levels;
+    let img = crate::vector::rasterise(e, &scene, levels)?;
+    let mut fx = crate::effects::GpuFx::new(e, img, scene.offset, scene.scale, levels);
+    r.run_effects_on(ctx, layer, false, &mut fx);
+    let out = fx.finish()?;
+    if let Some(k) = key {
+        e.g.vector.insert(k, out.clone());
+    }
+    Some(out)
 }
 
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
@@ -343,13 +384,18 @@ fn place(
     }
     let src = e.g.upload_buf(buf)?;
     let pl = r.placement(ctx, layer, buf);
+    Some(place_image(e, &src, &pl, target, mode, opacity, levels))
+}
+
+/// Draw a layer image already on the GPU onto `target` with its placement.
+fn place_image(e: &mut Enc, src: &GpuImage, pl: &Placement, target: &GpuImage, mode: BlendMode, opacity: f32, levels: Option<f32>) -> GpuImage {
     if let [m] = pl.matrices.as_slice() {
-        return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
+        return ops::warp_q(e, target, src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
     }
     let mut acc = e.zeros(target.width, target.height);
     let k = 1.0 / pl.matrices.len() as f32;
     for m in &pl.matrices {
-        acc = ops::warp(e, &acc, &src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
+        acc = ops::warp(e, &acc, src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
     }
-    Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
+    ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels)
 }

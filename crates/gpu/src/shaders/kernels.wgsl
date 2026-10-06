@@ -182,6 +182,19 @@ fn quantize(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, quantize_px(textureLoad(src, p, 0), P.f[0].x, P.f[0].y));
 }
 
+// Straight RGBA8 (a vello target) → premultiplied, clamped and quantised when levels > 0.
+// f[0] = (levels, 1 / levels)
+@compute @workgroup_size(16, 16)
+fn premultiply8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let s = textureLoad(src, p, 0);
+    store_q(p, vec4<f32>(s.xyz * s.w, s.w), P.f[0].x, P.f[0].y);
+}
+
 fn quantize_px(s: vec4<f32>, levels: f32, inv: f32) -> vec4<f32> {
     // Use the CPU-rounded reciprocal to avoid backend-dependent division.
     let a = floor(clamp(s.w, 0.0, 1.0) * levels + 0.5) * inv;

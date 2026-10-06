@@ -83,6 +83,7 @@ mod fx_vr;
 mod fx_warp;
 mod ops;
 mod particles;
+mod vector;
 mod walk;
 
 use std::sync::Arc;
@@ -378,3 +379,5 @@ mod tests_fx_vr;
 mod tests_fx_warp;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_vector;

@@ -19,6 +19,9 @@ effectcraft-effects = { workspace = true }
 effectcraft-render = { workspace = true }
 effectcraft-keyframe = { workspace = true }
 wgpu = { workspace = true }
+vello = { workspace = true }
+kurbo = { workspace = true }
+effectcraft-path = { workspace = true }
 bytemuck = { workspace = true }
 log = { workspace = true }
 

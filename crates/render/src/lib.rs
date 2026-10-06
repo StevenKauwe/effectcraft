@@ -1215,6 +1215,33 @@ impl<'a> Renderer<'a> {
         self.content_buf_timed(ctx, layer, None).map(|(b, _)| b)
     }
 
+    /// A shape layer's source as vector draws, for an accelerator that rasterises shapes itself:
+    /// what [`Self::layer_source`] would rasterise, at the same buffer size, offset and scale.
+    /// The caller clamps and quantises the pixels to the bit depth, as the source is here, then
+    /// runs the effects ([`Self::run_effects_on`]). `None` when the layer is not a shape layer, or
+    /// its source needs a CPU step this cannot describe (masks, shape motion blur, an authored
+    /// colour conversion, a paint blend mode).
+    pub fn shape_scene(&self, ctx: &EvalCtx, layer: &Layer) -> Option<shapes::ShapeScene> {
+        if !matches!(layer.source, LayerSource::Shape) || self.pipe.authored_in().is_some() || self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if layer
+            .masks()
+            .is_some_and(|m| m.groups().any(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != effectcraft_project::MaskMode::None)))
+        {
+            return None;
+        }
+        shapes::scene(ctx, layer, layer.props.sub("contents")?, self.raster_scale(ctx, layer))
+    }
+
+    /// The key [`Self::content_buf`] caches a layer's processed pixels under (source → masks →
+    /// effects at this render's scale and time), for an accelerator's own cache of the same
+    /// pixels. `None` when the content cannot be cached (expressions, time-dependent effects…).
+    pub fn content_key_of(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
+        let key = cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer));
+        self.content_key(ctx, layer, key)
+    }
+
     fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
         let key = self.cache.and_then(|_| cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
         let key = self.content_key(ctx, layer, key);

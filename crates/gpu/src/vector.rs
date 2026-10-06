@@ -1,0 +1,216 @@
+//! Shape layers rasterised on the GPU with vello (linebender's compute 2D renderer, on this
+//! device). The CPU renderer describes a shape layer's source as vector draws
+//! ([`Renderer::shape_scene`](effectcraft_render::Renderer::shape_scene): the buffer `shapes::render`
+//! would fill, strokes already outlined), vello fills them into an RGBA8 texture of that size,
+//! and a kernel premultiplies it into a working image, clamped and quantised to the bit depth as
+//! the CPU source is. Only the anti-aliasing differs from the CPU (vello's analytic area
+//! coverage against tiny-skia's), by a level or two on edges.
+//!
+//! Processed shape layers (source and effects) are kept on the GPU under the CPU layer cache's
+//! key, so a layer that does not change between frames is drawn once.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use effectcraft_geom::Mat3;
+use effectcraft_path::FillRule;
+use effectcraft_render::shapes::{ShapePaint, ShapeScene};
+use vello::kurbo::{Affine, BezPath, PathEl, Point};
+use vello::peniko::{self, Color, Fill};
+
+use crate::context::{Enc, GpuImage, Params};
+
+/// Processed shape layers kept on the GPU (bytes of RGBA f32).
+const CACHE_BUDGET: usize = 1024 << 20;
+
+/// Largest distance (buffer pixels) between a curve and the lines it is flattened into.
+const FLATTEN_TOLERANCE: f64 = 0.02;
+
+/// Gradient ramps are handed to vello as this many stops (plus the gradient's own).
+const RAMP_STOPS: usize = 64;
+
+/// A processed layer on the GPU: image, buffer offset and scale (as [`effectcraft_effects::Buf`]).
+pub(crate) type Content = (GpuImage, [f64; 2], f64);
+
+#[derive(Default)]
+struct Cache {
+    map: HashMap<u64, (Content, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+
+/// The vello renderer (built on first use; `None` when it could not be built on this device)
+/// and the processed-layer cache.
+#[derive(Default)]
+pub(crate) struct State {
+    renderer: OnceLock<Option<Mutex<vello::Renderer>>>,
+    cache: Mutex<Cache>,
+    /// Shape layer sources rasterised here (diagnostics, tests).
+    pub(crate) drawn: AtomicU64,
+}
+
+impl State {
+    pub(crate) fn get(&self, key: u64) -> Option<Content> {
+        let mut c = self.cache.lock().ok()?;
+        c.clock += 1;
+        let now = c.clock;
+        let (content, used) = c.map.get_mut(&key)?;
+        *used = now;
+        Some(content.clone())
+    }
+
+    pub(crate) fn insert(&self, key: u64, content: Content) {
+        let Ok(mut c) = self.cache.lock() else { return };
+        let bytes = content.0.width as usize * content.0.height as usize * 16;
+        if bytes > CACHE_BUDGET / 4 {
+            return;
+        }
+        c.clock += 1;
+        let now = c.clock;
+        if let Some(((old, _, _), _)) = c.map.insert(key, (content, now)) {
+            c.bytes -= old.width as usize * old.height as usize * 16;
+        }
+        c.bytes += bytes;
+        while c.bytes > CACHE_BUDGET {
+            let Some(k) = c.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| *k) else { break };
+            if let Some(((old, _, _), _)) = c.map.remove(&k) {
+                c.bytes -= old.width as usize * old.height as usize * 16;
+            }
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.map.clear();
+            c.bytes = 0;
+        }
+    }
+
+    fn renderer(&self, device: &wgpu::Device) -> Option<&Mutex<vello::Renderer>> {
+        self.renderer
+            .get_or_init(|| {
+                let opts = vello::RendererOptions {
+                    use_cpu: false,
+                    antialiasing_support: vello::AaSupport::area_only(),
+                    num_init_threads: std::num::NonZeroUsize::new(1),
+                    pipeline_cache: None,
+                };
+                match vello::Renderer::new(device, opts) {
+                    Ok(r) => Some(Mutex::new(r)),
+                    Err(e) => {
+                        log::info!("gpu: shape layers rasterise on the CPU (vello: {e})");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+}
+
+fn affine(m: &Mat3) -> Affine {
+    let a = &m.0;
+    Affine::new([a[0][0], a[1][0], a[0][1], a[1][1], a[0][2], a[1][2]])
+}
+
+fn color(c: [f32; 4]) -> Color {
+    Color::new(c)
+}
+
+/// The brush of a paint at `opacity`, and its transform (gradient space → layer space).
+fn brush(paint: &ShapePaint, opacity: f32) -> (peniko::Brush, Option<Affine>) {
+    match paint {
+        ShapePaint::Solid(c) => (peniko::Brush::Solid(color([c[0], c[1], c[2], c[3] * opacity])), None),
+        ShapePaint::Gradient { g, radial, start, end, focal, to_layer } => {
+            // The ramp is piecewise linear in straight colour between the colour and opacity
+            // stops: sample it there and evenly in between.
+            let mut ts: Vec<f64> = (0..=RAMP_STOPS).map(|i| i as f64 / RAMP_STOPS as f64).collect();
+            ts.extend(g.colors.iter().map(|s| s.0).chain(g.opacities.iter().map(|s| s.0)).filter(|t| (0.0..=1.0).contains(t)));
+            ts.sort_by(f64::total_cmp);
+            ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            let stops: Vec<(f32, Color)> = ts
+                .iter()
+                .map(|&t| {
+                    let c = g.sample(t);
+                    (t as f32, color([c[0], c[1], c[2], c[3] * opacity]))
+                })
+                .collect();
+            let (s, e) = (Point::new(start[0], start[1]), Point::new(end[0], end[1]));
+            let mut gr = if *radial {
+                let r = s.distance(e) as f32;
+                match focal {
+                    // Ray from the focal point to the circle: a two-point gradient from a point.
+                    Some(f) => peniko::Gradient::new_two_point_radial(Point::new(f[0], f[1]), 0.0, s, r),
+                    None => peniko::Gradient::new_radial(s, r),
+                }
+            } else {
+                peniko::Gradient::new_linear(s, e)
+            };
+            gr.interpolation_alpha_space = peniko::InterpolationAlphaSpace::Unpremultiplied;
+            (peniko::Brush::Gradient(gr.with_stops(stops.as_slice())), Some(affine(to_layer)))
+        }
+    }
+}
+
+/// Rasterise a shape scene into a premultiplied working image, clamped and quantised to
+/// `levels` when set. `None` = not handled here (no vello on this device, too large).
+pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Option<GpuImage> {
+    let (w, h) = (sc.width, sc.height);
+    if !e.g.fits(w, h) {
+        return None;
+    }
+    if sc.draws.is_empty() {
+        return Some(e.image(w, h));
+    }
+    let renderer = e.g.vector.renderer(&e.g.device)?;
+    let mut scene = vello::Scene::new();
+    for d in &sc.draws {
+        // All of a draw's paths fill as one (their windings add), as on the CPU. Curves are
+        // flattened here, in buffer pixels, finer than vello's own flattening: tiny-skia follows
+        // curves to a small fraction of a pixel, and ink outlines are mostly curves.
+        let to_px = affine(&d.to_px);
+        let mut path = BezPath::new();
+        for p in &d.paths {
+            if p.elements().iter().all(|el| matches!(el, PathEl::MoveTo(_) | PathEl::LineTo(_) | PathEl::ClosePath)) {
+                path.extend(p.elements().iter().map(|el| to_px * *el));
+            } else {
+                vello::kurbo::flatten(p.elements().iter().map(|el| to_px * *el), FLATTEN_TOLERANCE, |el| path.push(el));
+            }
+        }
+        let rule = match d.rule {
+            FillRule::NonZero => Fill::NonZero,
+            FillRule::EvenOdd => Fill::EvenOdd,
+        };
+        let (b, bt) = brush(&d.paint, d.opacity);
+        scene.fill(rule, Affine::IDENTITY, &b, bt.map(|t| to_px * t), &path);
+    }
+    let target = e.g.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vello shape layer"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: w, height: h, antialiasing_method: vello::AaConfig::Area };
+    {
+        // vello submits its own commands now, ahead of this encoder's: the kernel below,
+        // recorded here and submitted later, reads a finished texture.
+        let mut r = renderer.lock().ok()?;
+        if let Err(err) = r.render_to_texture(&e.g.device, &e.g.queue, &scene, &view, &params) {
+            log::warn!("gpu: vello: {err}");
+            return None;
+        }
+    }
+    let mut p = Params::default();
+    let l = levels.unwrap_or(0.0);
+    p.f[0] = [l, if l > 0.0 { 1.0 / l } else { 0.0 }, 0.0, 0.0];
+    let mut out = e.scratch(w, h);
+    e.pixels("premultiply8", &p, &GpuImage::new(target, w, h), None, &out, None);
+    out.levels = levels;
+    e.g.vector.drawn.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}

@@ -96,6 +96,8 @@ filmcraft-geom = { git = "https://github.com/storytold/filmcraft", rev = "2c5ba7
 wgpu = { version = "30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
 bytemuck = "1"
 pollster = "0.4"
+# GPU vector rasterisation of shape layers (linebender, Apache-2.0 OR MIT), on the same wgpu
+vello = { version = "0.11", default-features = false, features = ["wgpu"] }
 
 # ui
 egui = "0.36"

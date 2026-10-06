@@ -539,11 +539,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf
         })
         .collect();
     let Some(b) = resolved.iter().map(|r| r.2).reduce(|a, b| a.union(b)) else { return Buf { img: Image::new(1, 1), offset: [0.0, 0.0], scale: s } };
-    // Keep buffers sane for runaway geometry.
-    let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
-    let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
-    let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
-    let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
+    let (w, h, offset) = buffer_rect(b, s);
     let m = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
     let px_rect = |r: kurbo::Rect| -> Option<PxRect> {
         let x0 = (r.x0 * s + offset[0]).floor().max(0.0);
@@ -580,6 +576,95 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf
         i = j;
     }
     Buf { img, offset, scale: s }
+}
+
+/// A shape layer's contents as vector draws for another rasteriser (the GPU's): exactly the
+/// buffer [`render`] fills (`width × height` pixels, layer point p at pixel p × `scale` +
+/// `offset`), with every stroke already turned into the outline [`render`] would fill.
+#[derive(Clone, Debug)]
+pub struct ShapeScene {
+    pub width: u32,
+    pub height: u32,
+    pub offset: [f64; 2],
+    pub scale: f64,
+    /// Bottom-most first, each composited Normal over the ones before.
+    pub draws: Vec<ShapeDraw>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShapeDraw {
+    /// Filled outlines in layer space.
+    pub paths: Vec<BezPath>,
+    pub rule: FillRule,
+    /// Layer space → buffer pixels.
+    pub to_px: Mat3,
+    pub paint: ShapePaint,
+    pub opacity: f32,
+}
+
+#[derive(Clone, Debug)]
+pub enum ShapePaint {
+    /// Straight RGBA.
+    Solid([f32; 4]),
+    /// `g` sampled at the ramp position of each point (see [`GradientRamp`]), in gradient space:
+    /// `to_layer` maps gradient space to layer space. `focal` is the radial highlight's focal
+    /// point (gradient space), when it has one.
+    Gradient { g: Gradient, radial: bool, start: [f64; 2], end: [f64; 2], focal: Option<[f64; 2]>, to_layer: Mat3 },
+}
+
+/// The buffer [`render`] makes for draw bounds `b` at scale `s`: (width, height, offset).
+fn buffer_rect(b: kurbo::Rect, s: f64) -> (u32, u32, [f64; 2]) {
+    // Keep buffers sane for runaway geometry.
+    let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
+    let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
+    let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
+    (w, h, [-b.x0 * s + 2.0, -b.y0 * s + 2.0])
+}
+
+/// [`render`]'s contents as a [`ShapeScene`] instead of pixels. `None` when a draw uses
+/// something only the CPU rasteriser composites (a paint blend mode other than Normal).
+pub fn scene(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Option<ShapeScene> {
+    let mut arena = Vec::new();
+    let (draws, _) = collect(ctx, layer, contents, &mut arena);
+    let mut resolved: Vec<(&Draw, Vec<BezPath>, kurbo::Rect)> = Vec::new();
+    for d in draws.iter().rev().filter(|d| d.opacity > 0.0) {
+        let paths: Vec<BezPath> = d.slots.iter().map(|&i| arena[i].clone()).filter(|p| !p.elements().is_empty()).collect();
+        let Some(b) = draw_bounds(d, &paths) else { continue };
+        if d.blend != BlendMode::Normal {
+            return None;
+        }
+        resolved.push((d, paths, b));
+    }
+    let Some(b) = resolved.iter().map(|r| r.2).reduce(|a, b| a.union(b)) else {
+        return Some(ShapeScene { width: 1, height: 1, offset: [0.0; 2], scale: s, draws: vec![] });
+    };
+    let (w, h, offset) = buffer_rect(b, s);
+    let m = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
+    let out = resolved
+        .into_iter()
+        .filter_map(|(d, paths, _)| {
+            // Strokes are outlined as `draw_coverage` does: scaled with their group transform,
+            // flattened for the buffer's resolution.
+            let outline = |style: &StrokeStyle| -> Option<Vec<BezPath>> {
+                let mut st = style.clone();
+                st.width *= d.xf.mean_scale();
+                effectcraft_path::stroke_outline(&paths, &st, m.mean_scale()).map(|o| vec![o])
+            };
+            let (paths, rule) = match &d.paint {
+                Paint::Fill { rule, .. } | Paint::Gradient { rule, stroke: None, .. } => (paths.clone(), *rule),
+                Paint::Stroke { style, .. } | Paint::Gradient { stroke: Some(style), .. } => (outline(style)?, FillRule::NonZero),
+            };
+            let paint = match &d.paint {
+                Paint::Fill { color, .. } | Paint::Stroke { color, .. } => ShapePaint::Solid(*color),
+                Paint::Gradient { g, radial, start, end, highlight, .. } => {
+                    let ramp = GradientRamp::new(*radial, *start, *end, *highlight);
+                    ShapePaint::Gradient { g: g.clone(), radial: *radial, start: *start, end: *end, focal: ramp.focal, to_layer: d.xf }
+                }
+            };
+            Some(ShapeDraw { paths, rule, to_px: m, paint, opacity: d.opacity })
+        })
+        .collect();
+    Some(ShapeScene { width: w, height: h, offset, scale: s, draws: out })
 }
 
 #[cfg(test)]
