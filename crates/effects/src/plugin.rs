@@ -21,6 +21,10 @@
 //!   pixel distances like blur radii by it);
 //! * rendering must be deterministic (same inputs, same output) and may run on several threads
 //!   at once.
+//!
+//! A Rust plug-in may also provide a GPU implementation ([`EffectPlugin::gpu_kernel`]): WGSL
+//! compute passes that the GPU compositor (`effectcraft-gpu`) runs on the GPU-resident image
+//! instead of reading it back for `render`. `render` stays the reference the kernel must match.
 
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -221,6 +225,63 @@ impl PluginParams<'_> {
     }
 }
 
+/// The bindings every plug-in GPU kernel sees: the GPU compositor puts this in front of
+/// [`GpuKernel::wgsl`]. Names declared here (`PluginFrame`, `frame`, `src`, `orig`, `dst`,
+/// `params`, `table`) are taken.
+pub const GPU_KERNEL_PRELUDE: &str = r"// effectcraft plug-in kernel bindings
+struct PluginFrame {
+    size: vec2<u32>,   // buffer width and height in pixels
+    pass_index: u32,   // index of this pass in GpuKernel::passes
+    param_count: u32,  // floats in `params`
+    time: f32,         // layer time in seconds
+    scale: f32,        // buffer pixels per layer pixel
+    table_len: u32,    // floats in `table` (0 without a table)
+    _pad: u32,
+}
+@group(0) @binding(0) var<uniform> frame: PluginFrame;
+// the previous pass's output (the first pass: the effect's input)
+@group(0) @binding(1) var src: texture_2d<f32>;
+// the effect's input, in every pass
+@group(0) @binding(2) var orig: texture_2d<f32>;
+@group(0) @binding(3) var dst: texture_storage_2d<rgba32float, write>;
+// EffectPlugin::gpu_params
+@group(0) @binding(4) var<storage, read> params: array<f32>;
+// GpuKernel::table (one zero when there is none)
+@group(0) @binding(5) var<storage, read> table: array<f32>;
+";
+
+/// A plug-in's GPU implementation ([`EffectPlugin::gpu_kernel`]): WGSL compute passes with
+/// [`EffectPlugin::render`]'s semantics.
+///
+/// Each pass is a compute entry point declared `@compute @workgroup_size(16, 16)`, dispatched
+/// once over the buffer (one invocation per pixel, `global_invocation_id.xy`; invocations past
+/// `frame.size` must return). It reads the bindings of [`GPU_KERNEL_PRELUDE`]: `src` (the
+/// previous pass's output; the effect's input for the first pass), `orig` (the effect's input),
+/// `params` ([`EffectPlugin::gpu_params`]) and `table`, and writes every pixel of `dst` with
+/// `textureStore`. The last pass's `dst` is the effect's output, at the input's size, offset and
+/// scale (kernels cannot pad or resize the buffer). Pixels are premultiplied RGBA `f32`, as for
+/// `render`. If the WGSL does not compile on a device, the effect renders on the CPU there.
+#[derive(Clone)]
+pub struct GpuKernel {
+    /// The passes' entry points and their helpers (without the prelude).
+    pub wgsl: String,
+    /// Entry points, run in order.
+    pub passes: Vec<String>,
+    /// Read-only data that is the same for every frame (noise textures, lookup tables):
+    /// uploaded once per device, `table` in WGSL.
+    pub table: Option<Arc<[f32]>>,
+}
+
+impl std::fmt::Debug for GpuKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuKernel")
+            .field("wgsl_bytes", &self.wgsl.len())
+            .field("passes", &self.passes)
+            .field("table_len", &self.table.as_ref().map(|t| t.len()))
+            .finish()
+    }
+}
+
 /// An effect plug-in.
 pub trait EffectPlugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -230,6 +291,22 @@ pub trait EffectPlugin: Send + Sync {
     /// Where the plug-in came from (a file path, `built-in`…), for listings.
     fn source(&self) -> String {
         "built-in".into()
+    }
+    /// A GPU implementation of [`EffectPlugin::render`] (see [`GpuKernel`]): with GPU
+    /// acceleration on, the GPU compositor runs it instead of reading the frame back for
+    /// `render`. It must produce what `render` produces. `None` (the default): the effect
+    /// always renders on the CPU. Asked once, at registration, and again for each GPU frame, so
+    /// return the same kernel every time.
+    fn gpu_kernel(&self) -> Option<&GpuKernel> {
+        None
+    }
+    /// The kernel's `params` for one frame of a buffer at `scale` (buffer pixels per layer
+    /// pixel). The default is the flattened parameters as `f32`, in declaration order (see the
+    /// module docs). Override it to derive values in `f64` on the CPU first, such as integer
+    /// frame or drawing numbers from `time`, which `f32` time on the GPU cannot give exactly.
+    fn gpu_params(&self, params: &PluginParams, time: f64, scale: f64) -> Vec<f32> {
+        let _ = (time, scale);
+        params.flat.iter().map(|v| *v as f32).collect()
     }
 }
 
@@ -272,10 +349,16 @@ fn param_spec(p: &PluginParam) -> ParamSpec {
 
 /// Register a plug-in effect: it appears in Effects & Presets under its category and is
 /// applied by id like a built-in. Fails for a bad manifest, a taken id or when
-/// [`MAX_PLUGINS`] are registered.
+/// [`MAX_PLUGINS`] are registered. A plug-in with a [`GpuKernel`] is a GPU effect
+/// ([`EffectSpec::gpu`]).
 pub fn register_plugin(plugin: Arc<dyn EffectPlugin>) -> Result<&'static EffectSpec, String> {
     let m = plugin.manifest().clone();
     m.validate()?;
+    let gpu = match plugin.gpu_kernel() {
+        Some(k) if k.passes.is_empty() => return Err(format!("plug-in `{}`: a GPU kernel needs at least one pass", m.id)),
+        Some(_) => true,
+        None => false,
+    };
     let mut specs = plugin_specs().write().map_err(|_| "plug-in registry poisoned".to_string())?;
     if crate::registry().iter().any(|s| s.id == m.id) || specs.iter().any(|s| s.id == m.id) {
         return Err(format!("an effect with id `{}` is already registered", m.id));
@@ -288,7 +371,7 @@ pub fn register_plugin(plugin: Arc<dyn EffectPlugin>) -> Result<&'static EffectS
         category: leak(&m.category),
         params: m.params.iter().map(param_spec).collect(),
         render: TRAMPOLINES[slot],
-        gpu: false,
+        gpu,
         float: true,
     }));
     specs.push(spec);
@@ -311,14 +394,19 @@ const TRAMPOLINES: [RenderFn; MAX_PLUGINS] = trampolines!(
 
 /// Flatten an instance's evaluated parameters for the plug-in (points mapped to frame pixels).
 pub fn flatten(m: &PluginManifest, ctx: &EffectCtx, buf: &Buf) -> Vec<f64> {
+    flatten_at(m, ctx, buf.offset, buf.scale)
+}
+
+/// [`flatten`] for a buffer with this offset and scale ([`Buf::to_px`]) whose pixels live
+/// elsewhere (on the GPU).
+pub fn flatten_at(m: &PluginManifest, ctx: &EffectCtx, offset: [f64; 2], scale: f64) -> Vec<f64> {
     let mut out = Vec::with_capacity(m.flat_len());
     for p in &m.params {
         let v = ctx.params.get(&p.id);
         match &p.kind {
             PluginParamKind::Point { .. } => {
                 let q = v.map(Value::as_vec2).unwrap_or([0.0; 2]);
-                let (x, y) = buf.to_px(q);
-                out.extend([x, y]);
+                out.extend([q[0] * scale + offset[0], q[1] * scale + offset[1]]);
             }
             PluginParamKind::Color { .. } => {
                 let c = v.map(Value::as_color).unwrap_or([1.0; 4]);

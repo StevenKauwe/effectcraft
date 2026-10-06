@@ -31,7 +31,8 @@
 //! colour-management effects interpret colour programs built next to the CPU effects
 //! (`fx_lut`), simulations keep their state on the CPU and rasterise its per-frame plan here
 //! (`fx_sim`, `fx_particles`), and so do the geometry generators (`fx_gen2`: bolts, strokes,
-//! glyphs, audio marks, waves).
+//! glyphs, audio marks, waves). Plug-in effects that bring their own WGSL kernel
+//! ([`effectcraft_effects::plugin::EffectPlugin::gpu_kernel`]) run here too (`fx_plugin`).
 //!
 //! Working textures come from a pool (`context::Pool`): a frame allocates several full-frame
 //! RGBA f32 images per layer, and creating and zeroing those cost more than compositing a small
@@ -71,6 +72,7 @@ mod fx_lut;
 mod fx_noise;
 mod fx_particles;
 mod fx_pixel2;
+mod fx_plugin;
 mod fx_sim;
 mod fx_stylize;
 mod fx_text;
@@ -356,6 +358,8 @@ mod tests_fx_noise;
 mod tests_fx_particles;
 #[cfg(test)]
 mod tests_fx_pixel2;
+#[cfg(test)]
+mod tests_fx_plugin;
 #[cfg(test)]
 mod tests_fx_sim;
 #[cfg(test)]

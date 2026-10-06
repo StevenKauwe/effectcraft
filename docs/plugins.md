@@ -121,6 +121,55 @@ register_plugin(Arc::new(Swap(manifest)))?; // before the UI builds its menus
 `PluginParams` reads values by parameter id (`f`, `b`, `point`, `color`). At most 64 plug-in
 effects can be registered per process.
 
+### GPU kernels
+
+With GPU acceleration on, a plug-in effect normally makes the GPU compositor read the frame back,
+run `render` on the CPU and upload the result. A Rust plug-in can avoid that by also providing a
+GPU kernel: WGSL compute passes with `render`'s semantics. `render` stays the reference, the
+kernel must match it, and the effect gets the GPU badge.
+
+```rust
+impl EffectPlugin for Swap {
+    // manifest, render as above
+    fn gpu_kernel(&self) -> Option<&GpuKernel> {
+        Some(&self.kernel) // built once: the same kernel every call
+    }
+}
+
+let kernel = GpuKernel {
+    wgsl: r"
+        @compute @workgroup_size(16, 16)
+        fn swap(@builtin(global_invocation_id) id: vec3<u32>) {
+            if (id.x >= frame.size.x || id.y >= frame.size.y) { return; }
+            let c = textureLoad(src, vec2<i32>(id.xy), 0);
+            textureStore(dst, vec2<i32>(id.xy), select(c, c.zyxw, params[0] != 0.0));
+        }".into(),
+    passes: vec!["swap".into()],
+    table: None,
+};
+```
+
+* The compositor puts `effectcraft_effects::plugin::GPU_KERNEL_PRELUDE` in front of the source.
+  It declares `frame` (size, pass index, parameter count, layer time, scale, table length),
+  `src` (the previous pass's output; for the first pass, the effect's input), `orig` (the
+  effect's input), `dst` (the output, `rgba32float`), `params` and `table` (read-only `f32`
+  arrays). Those names are taken.
+* `passes` are entry points declared `@workgroup_size(16, 16)`, run in order, one invocation
+  per pixel. Each must write every pixel of `dst`, and the last pass's `dst` is the result.
+  Several passes cover effects that need neighbourhoods of an intermediate result, such as a
+  displacement followed by a blur of the displaced image.
+* `params` is `EffectPlugin::gpu_params`. By default it holds the flattened parameters as `f32`
+  (points in buffer pixels). Override it to derive values on the CPU in `f64`, such as frame or
+  drawing numbers from the time, scaled radii or seeds.
+* `table` is constant data (noise textures, lookup tables), uploaded once per device.
+* The output keeps the input's size, offset and scale: kernels cannot pad or resize.
+* A kernel that fails to compile on a device is logged once, and the effect then renders on the
+  CPU there. On the web build, plug-in kernels always render on the CPU, because compile errors
+  cannot be waited for.
+
+This is an optional Rust-side addition: the manifest, the WebAssembly ABI and the API version
+are unchanged, and plug-ins without a kernel behave as before.
+
 ## Compatibility
 
 The API version is checked when a plug-in loads: a manifest or module for another version is

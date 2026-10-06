@@ -10,9 +10,9 @@ use crate::context::{Enc, GpuImage, Params};
 use crate::ops;
 
 /// Effects with a GPU implementation (must equal `effectcraft_effects::GPU_EFFECTS`), plus the
-/// expression controls (pass-throughs).
+/// expression controls (pass-throughs) and plug-ins with a GPU kernel (`fx_plugin`).
 pub fn supports(id: &str) -> bool {
-    effectcraft_effects::GPU_EFFECTS.contains(&id) || id.starts_with("ec.control.")
+    effectcraft_effects::GPU_EFFECTS.contains(&id) || id.starts_with("ec.control.") || crate::fx_plugin::has_kernel(id)
 }
 
 /// A layer buffer on the GPU (see [`Buf`]).
@@ -178,6 +178,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ if crate::fx_time::IDS.contains(&id) => crate::fx_time::apply(e, id, ctx, b),
         _ if crate::fx_pixel2::IDS.contains(&id) => crate::fx_pixel2::apply(e, id, ctx, b),
         _ if crate::fx_gen2::IDS.contains(&id) => crate::fx_gen2::apply(e, id, ctx, b),
+        _ if crate::fx_plugin::has_kernel(id) => crate::fx_plugin::apply(e, id, ctx, b),
         _ => pointwise(e, id, ctx, b),
     }
 }

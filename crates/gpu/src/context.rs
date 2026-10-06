@@ -267,9 +267,11 @@ pub struct GpuContext {
     pub(crate) particle_states: crate::particles::StatesCell,
     /// Deferred readbacks (a browser worker's WebGPU device), see [`crate::deferred`].
     pub(crate) deferred: Option<Arc<crate::deferred::Deferred>>,
+    /// Plug-in kernels compiled for this device (built on first use).
+    pub(crate) plugin_kernels: crate::fx_plugin::Kernels,
 }
 
-fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -282,7 +284,7 @@ fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -492,6 +494,7 @@ impl GpuContext {
             particles: Default::default(),
             particle_states: Default::default(),
             deferred: None,
+            plugin_kernels: Default::default(),
         })
     }
 
@@ -831,6 +834,21 @@ impl<'g> Enc<'g> {
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
+        if self.pending >= 256 {
+            self.submit();
+        }
+    }
+
+    /// Run a pipeline that has its own bind group layout (plug-in kernels, `fx_plugin`).
+    pub(crate) fn dispatch_with(&mut self, label: &str, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, groups: (u32, u32)) {
+        let enc = self.encoder();
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
+        }
+        self.pending += 1;
         if self.pending >= 256 {
             self.submit();
         }
