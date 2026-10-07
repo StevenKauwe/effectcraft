@@ -279,14 +279,14 @@ fn shell(width: u32, height: u32, offset: [f64; 2], scale: f64) -> Buf {
 /// whole once and reused, unless the whole is much larger than what shows.
 fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, view: (u32, u32)) -> Option<crate::vector::Content> {
     let full_key = r.content_key_of(ctx, layer);
-    if let Some(hit) = full_key.and_then(|k| e.g.vector.get(k)) {
+    if let Some(hit) = full_key.and_then(|k| crate::vector::lookup(e, k)) {
         return Some(hit);
     }
     let mut scene = r.shape_scene(ctx, layer)?;
     let mut key = full_key;
     if let Some(crop) = visible_crop(r, ctx, layer, &scene, view) {
         let crop_key = full_key.map(|k| effectcraft_render::cache::derive(k, crop_bits(crop)));
-        if let Some(hit) = crop_key.and_then(|k| e.g.vector.get(k)) {
+        if let Some(hit) = crop_key.and_then(|k| crate::vector::lookup(e, k)) {
             return Some(hit);
         }
         // Drawing all of a static layer pays off when it is not much larger than what shows.
@@ -302,7 +302,7 @@ fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, view: 
     r.run_effects_on(ctx, layer, false, &mut fx);
     let out = fx.finish()?;
     if let Some(k) = key {
-        e.g.vector.insert(k, out.clone());
+        crate::vector::publish(e, k, out.clone());
     }
     Some(out)
 }

@@ -817,6 +817,9 @@ pub(crate) struct Enc<'g> {
     pub(crate) failed: bool,
     /// Parameter buffers of the recorded kernels and their bytes, written at submit.
     params: Vec<(wgpu::Buffer, Vec<u8>)>,
+    /// Processed shape layers drawn here, cached for other frames once submitted
+    /// ([`crate::vector::publish`]).
+    pub(crate) unpublished: Vec<(u64, crate::vector::Content)>,
 }
 
 impl Drop for Enc<'_> {
@@ -843,7 +846,7 @@ impl<'g> Enc<'g> {
         if let Ok(mut p) = g.pool.lock() {
             p.enc_begin(id);
         }
-        Enc { g, id, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false, params: Vec::new() }
+        Enc { g, id, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false, params: Vec::new(), unpublished: Vec::new() }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -1051,6 +1054,12 @@ impl<'g> Enc<'g> {
         }
         self.pending = 0;
         self.g.vector.recycle(std::mem::take(&mut self.recycle));
+        // A failed step (a vello render) left them wrong: don't share them.
+        for (key, content) in std::mem::take(&mut self.unpublished) {
+            if !self.failed {
+                self.g.vector.insert(key, content);
+            }
+        }
     }
 
     /// Hand a vello target back to its pool once the work recorded so far is submitted.

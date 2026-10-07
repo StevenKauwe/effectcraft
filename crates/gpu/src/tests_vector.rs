@@ -252,3 +252,29 @@ fn vello_targets_are_reused_after_submit() {
     assert_eq!(read(&mut other, &other_b), fb, "a layer draws the same pixels anywhere in an atlas");
     assert!(!e.failed && !other.failed);
 }
+
+/// A processed shape layer reaches the GPU cache only once the encoder that draws it has
+/// submitted that work: another thread's frame that took it earlier could be submitted first
+/// and read the texture before it was drawn (an empty layer, or a reused texture's old pixels).
+/// Until then the drawing encoder still finds it itself.
+#[test]
+fn cached_shape_layers_are_shared_only_once_drawn() {
+    let painted = painted(BitDepth::Bpc32, false);
+    let Some(g) = gpu() else { return };
+    g.context().clear_uploads();
+    let r = Renderer::new(&painted.p, &Pattern, RenderOpts::default());
+    let ctx = r.eval_ctx(painted.cid, Tick::ZERO).expect("comp");
+    let layer = ctx.comp.layers.iter().find(|l| l.name == "ink").expect("layer");
+    let scene = r.shape_scene(&ctx, layer).expect("a shape scene");
+    let key = 0x5eed_cafe_u64;
+    let mut a = crate::context::Enc::new(g.context());
+    let img = crate::vector::rasterise(&mut a, &scene, None).expect("vello");
+    crate::vector::publish(&mut a, key, (img.clone(), scene.offset, scene.scale));
+    assert!(g.context().vector.get(key).is_none(), "not shared before its encoder submits");
+    assert!(crate::vector::lookup(&a, key).is_some(), "its own encoder finds it");
+    let want = a.download(&img).expect("readback");
+    let shared = g.context().vector.get(key).expect("shared once submitted");
+    let mut b = crate::context::Enc::new(g.context());
+    assert_eq!(b.download(&shared.0).expect("readback").data, want.data);
+    assert!(want.data.iter().any(|p| p[3] > 0.0), "the layer drew something");
+}

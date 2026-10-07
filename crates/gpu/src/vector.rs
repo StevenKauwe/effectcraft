@@ -81,8 +81,6 @@ impl State {
     }
 
     pub(crate) fn insert(&self, key: u64, content: Content) {
-        // Other frames' encoders will read it.
-        content.0.share();
         let Ok(mut c) = self.cache.lock() else { return };
         let bytes = content.0.width as usize * content.0.height as usize * 16;
         if bytes > CACHE_BUDGET / 4 {
@@ -225,6 +223,24 @@ fn brush(paint: &ShapePaint, opacity: f32) -> (peniko::Brush, Option<Affine>) {
             (peniko::Brush::Gradient(gr.with_stops(stops.as_slice())), Some(affine(to_layer)))
         }
     }
+}
+
+/// Offer processed content `e` drew to other frames under `key`. It goes into the cache when
+/// `e` submits the work that draws it ([`Enc::submit`]): another encoder that took it sooner could
+/// be submitted first and read the texture before it was drawn. `e` finds it at once
+/// ([`lookup`]).
+pub(crate) fn publish(e: &mut Enc, key: u64, content: Content) {
+    // Other frames' encoders will read it.
+    content.0.share();
+    e.unpublished.push((key, content));
+}
+
+/// Processed content under `key`: drawn by `e` itself, or cached (drawn and submitted).
+pub(crate) fn lookup(e: &Enc, key: u64) -> Option<Content> {
+    if let Some((_, c)) = e.unpublished.iter().find(|(k, _)| *k == key) {
+        return Some(c.clone());
+    }
+    e.g.vector.get(key)
 }
 
 /// Shape layers drawn by one encoder share vello renders: each goes into its own region of an
