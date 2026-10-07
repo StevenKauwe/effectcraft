@@ -353,17 +353,30 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     let frame_end_time = |k: u64| -> Tick { if k >= total { span_end } else { job.settings.frame_time(comp, k) } };
     write_video(&mut mux, pending)?;
     write_audio_until(&mut mux, frame_end_time(first_end), &mut cursor)?;
+    // Each batch renders while the one before it encodes.
     let mut i = first_end;
-    while i < total {
+    let mut rendered: Option<(u64, Vec<Vec<u8>>)> = None;
+    while i < total || rendered.is_some() {
         let end = (i + batch).min(total);
-        let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), render).await;
-        for (k, px) in frames.iter().enumerate() {
-            let ps = venc.encode(px, i + k as u64)?;
-            write_video(&mut mux, ps)?;
+        let prev = rendered.take();
+        let encode = || -> Result<()> {
+            let Some((start, frames)) = prev else { return Ok(()) };
+            let n = frames.len() as u64;
+            for (k, px) in frames.iter().enumerate() {
+                let ps = venc.encode(px, start + k as u64)?;
+                write_video(&mut mux, ps)?;
+            }
+            write_audio_until(&mut mux, frame_end_time(start + n), &mut cursor)?;
+            st.advance(n)
+        };
+        if i < total {
+            let (frames, done) = job.frames_while(comp, (i..end).collect(), render, encode).await;
+            done?;
+            rendered = Some((i, frames));
+            i = end;
+        } else {
+            encode()?;
         }
-        write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
-        st.advance(end - i)?;
-        i = end;
     }
     write_video(&mut mux, venc.flush()?)?;
     write_audio_until(&mut mux, span_end, &mut cursor)?;

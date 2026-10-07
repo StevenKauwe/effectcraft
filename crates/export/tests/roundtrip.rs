@@ -170,6 +170,25 @@ fn h264_mp4_roundtrip() {
     }
 }
 
+/// On two rayon threads the 12 frames go out in batches of two, each rendering while the one
+/// before it encodes. The file must be byte-identical to a single-batch export.
+#[test]
+fn h264_overlapped_batches_match_one_batch() {
+    let d = out_dir("h264-batches");
+    let (p, cid) = project(None);
+    let om = OutputModule { bitrate_kbps: 4000, ..OutputModule::for_format(OutputFormat::H264) };
+    let export_on = |threads: usize, name: &str| {
+        let path = d.join(name);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        pool.install(|| run(&p, cid, &NoFootage, &om, &path));
+        path
+    };
+    let batched = export_on(2, "batched.mp4");
+    let single = export_on(FRAMES as usize, "single.mp4");
+    decode_movie(&batched, FRAMES, 0.08);
+    assert_eq!(std::fs::read(&batched).expect("read"), std::fs::read(&single).expect("read"));
+}
+
 #[test]
 fn h264_odd_size_is_cropped_even() {
     let d = out_dir("h264-odd");

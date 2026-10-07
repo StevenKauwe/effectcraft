@@ -117,6 +117,33 @@ impl<'a> Cx<'a> {
         ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
     }
 
+    /// [`Cx::frames`] while `work` (encoding the previous batch) runs on this thread: natively,
+    /// the batch renders on the current rayon pool meanwhile, so rendering and encoding overlap
+    /// instead of taking turns. Deferred readbacks (and wasm) run `work` first, then render.
+    pub async fn frames_while<T: Send, R>(
+        &self,
+        comp: &Comp,
+        ks: Vec<u64>,
+        f: impl Fn(u64, Image) -> T + Sync + Send,
+        work: impl FnOnce() -> R,
+    ) -> (Vec<T>, R) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.deferred() {
+            use rayon::prelude::*;
+            let mut frames = Vec::new();
+            // `in_place_scope` spawns into the pool this thread belongs to (the global pool from
+            // outside one), as `frames` does; a panic while rendering resurfaces when it ends.
+            let r = rayon::in_place_scope(|s| {
+                let (frames, f) = (&mut frames, &f);
+                s.spawn(move |_| *frames = ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect());
+                work()
+            });
+            return (frames, r);
+        }
+        let r = work();
+        (self.frames(comp, ks, f).await, r)
+    }
+
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
     pub fn frame(&self, comp: &Comp, i: u64) -> Image {
         effectcraft_render::passes::block_on(self.frame_async(comp, i))
