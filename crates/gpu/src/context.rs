@@ -244,7 +244,12 @@ pub struct GpuContext {
     pub(crate) max_dim: u32,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
-    pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Every kernel's source (one module) and the pipeline layout each entry point takes.
+    module: wgpu::ShaderModule,
+    layouts: HashMap<&'static str, wgpu::PipelineLayout>,
+    /// Kernel pipelines, built on first use: compiling all of them (Metal compiles each entry
+    /// point on its own) took longer than most renders, and a render uses a handful.
+    pipelines: Mutex<HashMap<&'static str, wgpu::ComputePipeline>>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     dummy: wgpu::Texture,
@@ -403,7 +408,7 @@ impl GpuContext {
             bind_group_layouts: &[Some(&bgl), Some(&bgl_ext)],
             immediate_size: 0,
         });
-        let pipelines = ENTRIES
+        let layouts = ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
             .chain(crate::fx_distort::KERNELS)
@@ -428,17 +433,7 @@ impl GpuContext {
             .chain(crate::adv3d::SKY_KERNELS)
             .map(|e| (e, &layout))
             .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| {
-                let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(e),
-                    layout: Some(layout),
-                    module: &module,
-                    entry_point: Some(e),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-                (*e, p)
-            })
+            .map(|(e, layout)| (*e, layout.clone()))
             .collect();
         let dmodule = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("effectcraft display"),
@@ -481,7 +476,9 @@ impl GpuContext {
             max_dim,
             bgl,
             bgl_ext,
-            pipelines,
+            module,
+            layouts,
+            pipelines: Default::default(),
             display_bgl,
             display,
             dummy_tex: dummy.create_view(&Default::default()),
@@ -571,6 +568,38 @@ impl GpuContext {
     /// key ([`crate::deferred`]) need this.
     pub fn can_wait(&self) -> bool {
         cfg!(not(target_arch = "wasm32")) && self.deferred.is_none()
+    }
+
+    /// The pipeline of kernel `entry`, built now if this is its first use. `None` for a name
+    /// that is not a kernel.
+    fn pipeline(&self, entry: &str) -> Option<wgpu::ComputePipeline> {
+        let (name, layout) = self.layouts.get_key_value(entry)?;
+        let mut built = self.pipelines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let p = built.entry(*name).or_insert_with(|| {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: Some(layout),
+                module: &self.module,
+                entry_point: Some(name),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        Some(p.clone())
+    }
+
+    /// Build every kernel's pipeline now (tests: a kernel that fails to compile for this
+    /// backend shows up without having to run it).
+    #[cfg(test)]
+    pub(crate) fn build_all_kernels(&self) -> usize {
+        let names: Vec<&'static str> = self.layouts.keys().copied().collect();
+        names.iter().filter(|n| self.pipeline(n).is_some()).count()
+    }
+
+    /// (kernel pipelines built so far, kernels there are) (tests).
+    #[cfg(test)]
+    pub(crate) fn kernels_built(&self) -> (usize, usize) {
+        (self.pipelines.lock().map(|p| p.len()).unwrap_or(0), self.layouts.len())
     }
 
     pub(crate) fn fits(&self, w: u32, h: u32) -> bool {
@@ -805,7 +834,7 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        let Some(pipe) = g.pipelines.get(entry) else {
+        let Some(pipe) = g.pipeline(entry) else {
             log::error!("gpu: no kernel {entry}");
             return;
         };
@@ -839,7 +868,7 @@ impl<'g> Enc<'g> {
         let enc = self.encoder();
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
-            pass.set_pipeline(pipe);
+            pass.set_pipeline(&pipe);
             pass.set_bind_group(0, &bg, &[]);
             if let Some(b) = &bg_ext {
                 pass.set_bind_group(1, b, &[]);

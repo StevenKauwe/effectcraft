@@ -688,3 +688,22 @@ fn devices_with_webgl2_limits_are_declined() {
     let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
     assert!(err.contains("max_storage_buffers_per_shader_stage"), "{err}");
 }
+
+/// Kernel pipelines are built on first use: a fresh device builds none, a frame builds the few
+/// it runs, and every kernel still compiles for this backend.
+#[test]
+fn kernels_build_on_first_use() {
+    hold_gpu_lock();
+    let Some(g) = Gpu::headless() else { return };
+    assert_eq!(g.ctx.kernels_built().0, 0, "a new context builds no kernel");
+    let mut s = Scene::new(BitDepth::Bpc8);
+    let l = s.footage(40, 30);
+    s.push(l);
+    let mut r = Renderer::new(&s.p, &Pattern, opts());
+    r.accel = Some(&g);
+    g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+    let (built, all) = g.ctx.kernels_built();
+    assert!(built > 0 && built * 4 < all, "a frame built {built} of {all} kernels");
+    assert_eq!(g.ctx.build_all_kernels(), all);
+    assert_eq!(g.ctx.kernels_built(), (all, all));
+}
