@@ -728,3 +728,53 @@ fn kernel_parameters_share_a_buffer_per_submit() {
         assert!(worst < 1e-6, "{l} levels: off by {worst}");
     }
 }
+
+/// A readback waiting for the GPU does not hold up other threads: texture destroys (which take
+/// wgpu-core's snatch lock exclusively; vello destroys textures after every render) keep
+/// returning promptly while the readback waits for long GPU work, instead of queueing behind it.
+#[test]
+fn readbacks_wait_without_holding_the_device_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let Some(g) = gpu() else { return };
+    let ctx = &g.ctx;
+    let (reading, done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (gpu_time, worst) = std::thread::scope(|s| {
+        let reader = s.spawn(|| {
+            let mut e = crate::context::Enc::new(ctx);
+            // Long GPU work (about a second on an M2 Max): quantise a 2048² image back and forth.
+            let mut img = e.image(2048, 2048);
+            for i in 0..100 {
+                img = crate::ops::quantize(&mut e, &img, if i % 2 == 0 { 255.0 } else { 254.0 });
+            }
+            let tiny = e.image(1, 1);
+            e.submit();
+            let start = Instant::now();
+            reading.store(true, Ordering::SeqCst);
+            // Queued after the quantising: mapped only once all of it has run.
+            let px = e.read_texture(&tiny.texture, 1, 1, 16);
+            done.store(true, Ordering::SeqCst);
+            assert!(px.is_some(), "readback");
+            drop(img);
+            start.elapsed()
+        });
+        while !reading.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let mut worst = Duration::ZERO;
+        while !done.load(Ordering::SeqCst) {
+            let t = ctx.image(64, 64).texture;
+            let start = Instant::now();
+            t.destroy();
+            worst = worst.max(start.elapsed());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (reader.join().expect("reader"), worst)
+    });
+    eprintln!("readback waited {gpu_time:?}; the slowest texture destroy meanwhile took {worst:?}");
+    if gpu_time < Duration::from_millis(100) {
+        eprintln!("GPU too fast for this check: skipped");
+        return;
+    }
+    assert!(worst * 4 < gpu_time, "a destroy took {worst:?} while a readback waited {gpu_time:?}");
+}

@@ -608,6 +608,26 @@ impl GpuContext {
         (self.pipelines.lock().map(|p| p.len()).unwrap_or(0), self.layouts.len())
     }
 
+    /// Wait for a `map_async` callback that sends its result on `rx`, polling the device
+    /// without blocking in between. A blocking poll holds wgpu-core's snatch lock for as long
+    /// as the GPU takes, and a texture destroy (vello destroys its transient textures after
+    /// every render) takes that lock exclusively, so every other thread's wgpu calls queued
+    /// behind this frame's GPU work. `None` when polling fails or the callback was dropped.
+    pub(crate) fn wait_mapped<T>(&self, rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
+        use std::sync::mpsc::RecvTimeoutError;
+        loop {
+            if let Err(e) = self.device.poll(wgpu::PollType::Poll) {
+                log::error!("gpu: poll: {e}");
+                return None;
+            }
+            match rx.recv_timeout(std::time::Duration::from_micros(200)) {
+                Ok(r) => return Some(r),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
     pub(crate) fn fits(&self, w: u32, h: u32) -> bool {
         w > 0 && h > 0 && w <= self.max_dim && h <= self.max_dim
     }
@@ -1027,11 +1047,7 @@ impl<'g> Enc<'g> {
         buf.map_async(wgpu::MapMode::Read, .., move |r| {
             let _ = tx.send(r);
         });
-        if let Err(e) = self.g.device.poll(wgpu::PollType::wait_indefinitely()) {
-            log::error!("gpu: poll: {e}");
-            return None;
-        }
-        rx.recv().ok()?.ok()?;
+        self.g.wait_mapped(&rx)?.ok()?;
         {
             let view = buf.get_mapped_range(..).ok()?;
             if row == padded as usize {
