@@ -170,10 +170,11 @@ fn h264_mp4_roundtrip() {
     }
 }
 
-/// On two rayon threads the 12 frames go out in batches of two, each rendering while the one
-/// before it encodes. The file must be byte-identical to a single-batch export.
+/// On two rayon threads the 12 frames stream through the encoder (at most four rendering at a
+/// time, out of order, while earlier ones encode). The file must be byte-identical to an export
+/// that renders all 12 in its first batch.
 #[test]
-fn h264_overlapped_batches_match_one_batch() {
+fn h264_streamed_frames_match_one_batch() {
     let d = out_dir("h264-batches");
     let (p, cid) = project(None);
     let om = OutputModule { bitrate_kbps: 4000, ..OutputModule::for_format(OutputFormat::H264) };

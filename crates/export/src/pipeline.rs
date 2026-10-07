@@ -117,31 +117,91 @@ impl<'a> Cx<'a> {
         ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
     }
 
-    /// [`Cx::frames`] while `work` (encoding the previous batch) runs on this thread: natively,
-    /// the batch renders on the current rayon pool meanwhile, so rendering and encoding overlap
-    /// instead of taking turns. Deferred readbacks (and wasm) run `work` first, then render.
-    pub async fn frames_while<T: Send, R>(
+    /// Output frames `ks`, each mapped by `f` (encoding) and handed to `sink` in order on this
+    /// thread. Natively they render on the current rayon pool (the global pool from outside
+    /// one), at most `window` at a time, and each goes to `sink` as soon as it and every frame
+    /// before it are done, so rendering never waits for a batch to finish while `sink` encodes.
+    /// Deferred readbacks (and wasm) render one by one. An error from `sink` starts no more
+    /// frames and is returned once the frames in flight are done.
+    pub async fn stream<T: Send, E>(
         &self,
         comp: &Comp,
         ks: Vec<u64>,
+        window: usize,
         f: impl Fn(u64, Image) -> T + Sync + Send,
-        work: impl FnOnce() -> R,
-    ) -> (Vec<T>, R) {
+        mut sink: impl FnMut(u64, T) -> Result<(), E>,
+    ) -> Result<(), E> {
         #[cfg(not(target_arch = "wasm32"))]
         if !self.deferred() {
-            use rayon::prelude::*;
-            let mut frames = Vec::new();
-            // `in_place_scope` spawns into the pool this thread belongs to (the global pool from
-            // outside one), as `frames` does; a panic while rendering resurfaces when it ends.
-            let r = rayon::in_place_scope(|s| {
-                let (frames, f) = (&mut frames, &f);
-                s.spawn(move |_| *frames = ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect());
-                work()
-            });
-            return (frames, r);
+            return self.stream_parallel(comp, &ks, window.max(1), &f, &mut sink);
         }
-        let r = work();
-        (self.frames(comp, ks, f).await, r)
+        for k in ks {
+            let img = self.frame_async(comp, k).await;
+            sink(k, f(k, img))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stream_parallel<T: Send, E>(
+        &self,
+        comp: &Comp,
+        ks: &[u64],
+        window: usize,
+        f: &(impl Fn(u64, Image) -> T + Sync + Send),
+        sink: &mut impl FnMut(u64, T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        use std::sync::mpsc::{RecvTimeoutError, Sender, TryRecvError, channel};
+        /// Reports a frame (`None` when rendering it panicked; the scope then re-raises the panic).
+        struct Done<T: Send>(Sender<(usize, Option<T>)>, usize, Option<T>);
+        impl<T: Send> Drop for Done<T> {
+            fn drop(&mut self) {
+                let _ = self.0.send((self.1, self.2.take()));
+            }
+        }
+        let (tx, rx) = channel::<(usize, Option<T>)>();
+        rayon::in_place_scope(|s| {
+            let start = |i: usize| {
+                let (tx, k) = (tx.clone(), ks[i]);
+                s.spawn(move |_| {
+                    let mut done = Done(tx, i, None);
+                    done.2 = Some(f(k, self.frame(comp, k)));
+                });
+            };
+            let mut started = ks.len().min(window);
+            (0..started).for_each(&start);
+            let (mut ready, mut next, mut result, mut stop) = (std::collections::BTreeMap::new(), 0, Ok(()), false);
+            while next < started {
+                let (i, v) = match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {
+                        // A worker of the pool runs queued frames itself while it waits.
+                        if matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                            continue;
+                        }
+                        match rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                            Ok(m) => m,
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                };
+                stop |= v.is_none();
+                ready.insert(i, v);
+                while let Some(v) = ready.remove(&next) {
+                    if let (Some(v), Ok(())) = (v, &result) {
+                        result = sink(ks[next], v);
+                    }
+                    next += 1;
+                    if result.is_ok() && !stop && started < ks.len() {
+                        start(started);
+                        started += 1;
+                    }
+                }
+            }
+            result
+        })
     }
 
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
