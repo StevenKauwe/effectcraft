@@ -28,7 +28,15 @@ pub(crate) struct Packet {
 
 pub(crate) trait VideoEncoder {
     fn sample_entry(&self) -> SampleEntry;
-    fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>>;
+    /// Encode frame `index`: its RGBA8 pixels, or what [`VideoEncoder::convert`] made of them.
+    fn encode(&mut self, frame: &[u8], index: u64) -> Result<Vec<Packet>>;
+    /// A conversion of each RGBA8 frame (`w` × `h`) that needs none of the encoder's state, such
+    /// as the colour conversion to its planes. Movie export runs it on the render threads as
+    /// each frame finishes, in parallel, and passes the result to `encode`, so the encoding
+    /// thread (the bottleneck once frames render fast) does less.
+    fn convert(&self) -> Option<fn(&[u8], u32, u32) -> Vec<u8>> {
+        None
+    }
     fn flush(&mut self) -> Result<Vec<Packet>>;
     /// Edit-list media start (B-frame delay) in the track timescale.
     fn media_start(&self) -> Option<i64> {
@@ -43,9 +51,6 @@ struct H264 {
     w: u32,
     h: u32,
     rate: FrameRate,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
 }
 
 impl H264 {
@@ -57,7 +62,7 @@ impl H264 {
         let kbps = kbps.max(100);
         cfg.rate = filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: kbps * 3 / 2 };
         let enc = filmcraft_h264enc::Encoder::new(cfg).map_err(enc)?;
-        Ok(H264 { enc, w, h, rate, y: vec![], u: vec![], v: vec![] })
+        Ok(H264 { enc, w, h, rate })
     }
     fn packets(&self, ps: Vec<filmcraft_h264enc::Packet>) -> Vec<Packet> {
         ps.into_iter().map(|p| Packet { data: p.data, key: p.keyframe, cto: (p.pts - p.dts) as i32 }).collect()
@@ -72,12 +77,20 @@ impl VideoEncoder for H264 {
         });
         SampleEntry::avc(cfg, self.w as u16, self.h as u16)
     }
-    fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>> {
-        rgba_to_yuv420(rgba, self.w as usize, self.h as usize, &mut self.y, &mut self.u, &mut self.v);
-        let cw = (self.w as usize).div_ceil(2);
-        let frame = filmcraft_h264enc::YuvFrame { y: &self.y, u: &self.u, v: &self.v, y_stride: self.w as usize, uv_stride: cw };
+    fn encode(&mut self, i420: &[u8], index: u64) -> Result<Vec<Packet>> {
+        let (w, cw, ch) = (self.w as usize, (self.w as usize).div_ceil(2), (self.h as usize).div_ceil(2));
+        let (luma, chroma) = (w * self.h as usize, cw * ch);
+        if i420.len() != luma + 2 * chroma {
+            return Err(enc(format!("H.264: a {}×{} frame has {} bytes of I420, not {}", self.w, self.h, i420.len(), luma + 2 * chroma)));
+        }
+        let (y, uv) = i420.split_at(luma);
+        let (u, v) = uv.split_at(chroma);
+        let frame = filmcraft_h264enc::YuvFrame { y, u, v, y_stride: w, uv_stride: cw };
         let ps = self.enc.try_encode(&frame, index as i64 * self.rate.den).map_err(enc)?;
         Ok(self.packets(ps))
+    }
+    fn convert(&self) -> Option<fn(&[u8], u32, u32) -> Vec<u8>> {
+        Some(i420)
     }
     fn flush(&mut self) -> Result<Vec<Packet>> {
         let ps = self.enc.flush();
@@ -88,13 +101,23 @@ impl VideoEncoder for H264 {
     }
 }
 
-/// BT.709 limited-range 8-bit 4:2:0 from RGBA8 (2×2 chroma average; alpha ignored).
+/// The Y, U and V planes of [`rgba_to_yuv420`], one after the other (H.264's frame format).
+fn i420(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (mut y, mut u, mut v) = (vec![], vec![], vec![]);
+    rgba_to_yuv420(rgba, w as usize, h as usize, &mut y, &mut u, &mut v);
+    y.extend_from_slice(&u);
+    y.extend_from_slice(&v);
+    y
+}
+
+/// BT.709 limited-range 8-bit 4:2:0 from RGBA8 (2×2 chroma average; alpha ignored). One frame
+/// on one thread: export converts several frames at once ([`VideoEncoder::convert`]).
 pub(crate) fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     y.resize(w * h, 0);
     u.resize(cw * ch, 0);
     v.resize(cw * ch, 0);
-    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
+    y.chunks_mut(w * 2).zip(u.chunks_mut(cw).zip(v.chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
         let rows = yr.len() / w;
         let mut acc = vec![(0f32, 0f32, 0f32); cw];
         for dy in 0..rows {
@@ -264,7 +287,14 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     };
     let brand = if fmt == OutputFormat::ProRes { Brand::Mov } else { Brand::Mp4 };
     let batch = batch_size();
-    let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> { job.pixels(&img, comp, channels, w, h) };
+    let convert = venc.convert();
+    let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> {
+        let px = job.pixels(&img, comp, channels, w, h);
+        match convert {
+            Some(c) => c(&px, w, h),
+            None => px,
+        }
+    };
 
     // Encode the first batch before creating tracks: encoders finalise their config on frame 1.
     let first_end = batch.min(st.total);
@@ -409,5 +439,19 @@ mod tests {
         assert_eq!(y10[1], 64);
         assert_eq!(cb[0], 512);
         assert!(cr[2] > 900, "red has high Cr: {}", cr[2]);
+    }
+
+    /// H.264 takes its frames converted on the render threads: Y, U and V one after the other,
+    /// and refuses a buffer of another size (an unconverted RGBA frame).
+    #[test]
+    fn h264_frames_are_i420() {
+        let rgba: Vec<u8> = (0..6 * 4 * 4).map(|i| (i * 37 % 256) as u8).collect();
+        let (mut y, mut u, mut v) = (vec![], vec![], vec![]);
+        rgba_to_yuv420(&rgba, 6, 4, &mut y, &mut u, &mut v);
+        let mut h264 = H264::new(6, 4, FrameRate::new(24, 1), 1000).expect("encoder");
+        let convert = h264.convert().expect("H.264 converts on the render threads");
+        assert_eq!(convert(&rgba, 6, 4), [y, u, v].concat());
+        assert!(h264.encode(&rgba, 0).is_err(), "RGBA is not a frame");
+        assert!(h264.encode(&convert(&rgba, 6, 4), 0).is_ok());
     }
 }
