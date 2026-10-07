@@ -101,6 +101,27 @@ pub struct JobOptions<'a> {
     pub storage: Option<&'a dyn StorageQuota>,
     /// Overflow folders, in order.
     pub overflow: Vec<String>,
+    /// Movie formats only: hand the frames to this instead of encoding and writing the movie
+    /// (a host's own encoder, such as a hardware one). No file and no audio are written.
+    pub frame_sink: Option<&'a dyn FrameSink>,
+}
+
+/// What a [`FrameSink`] receives for each frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// 8-bit RGBA, opaque: RGB over the comp's background, at the output size.
+    Rgba8,
+    /// The 8-bit Y, U and V planes (4:2:0, BT.709 limited range) one after the other: what the
+    /// built-in H.264 encoder encodes, so another encoder shows the same colours.
+    I420,
+}
+
+/// Takes a movie job's frames in place of the built-in encoder ([`JobOptions::frame_sink`]).
+pub trait FrameSink: Sync {
+    fn format(&self) -> FrameFormat;
+    /// Frame `index` (0 = the job's first), at [`output_size`]. Called in order, on one thread;
+    /// an error ends the export with [`ExportError::Encode`].
+    fn frame(&self, index: u64, pixels: &[u8]) -> std::result::Result<(), String>;
 }
 
 /// Progress after a batch of frames.
@@ -186,7 +207,10 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
     st.advance(0)?;
     let (w, h) = output_size(comp, cx.settings, cx.output);
     let mut report = match cx.output.format {
-        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes => encode::movie(cx, comp, w, h, &mut st).await?,
+        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes => match cx.options.frame_sink {
+            Some(sink) => encode::to_sink(cx, comp, w, h, &mut st, sink).await?,
+            None => encode::movie(cx, comp, w, h, &mut st).await?,
+        },
         OutputFormat::Gif => gif_export(cx, comp, w, h, &mut st).await?,
         OutputFormat::WebM => webm::webm(cx, comp, w, h, &mut st).await?,
         OutputFormat::Wav => webm::audio_file(cx, comp, false, &mut st)?,

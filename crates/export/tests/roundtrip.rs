@@ -11,7 +11,7 @@ use std::process::Command;
 
 use effectcraft_color::Label;
 use effectcraft_export::render_queue::{AudioOutput, Channels, OutputFormat, OutputModule, ProResProfile, RenderSettings, TimeSpan, sequence_path};
-use effectcraft_export::{Job, Progress, export};
+use effectcraft_export::{FrameFormat, FrameSink, Job, JobOptions, Progress, export};
 use effectcraft_media::MediaPool;
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, Project, Solid, build};
 use effectcraft_raster::Image;
@@ -188,6 +188,80 @@ fn h264_streamed_frames_match_one_batch() {
     let single = export_on(FRAMES as usize, "single.mp4");
     decode_movie(&batched, FRAMES, 0.08);
     assert_eq!(std::fs::read(&batched).expect("read"), std::fs::read(&single).expect("read"));
+}
+
+/// Collects what a frame sink receives.
+struct Frames {
+    format: FrameFormat,
+    got: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+    fail_at: Option<u64>,
+}
+
+impl FrameSink for Frames {
+    fn format(&self) -> FrameFormat {
+        self.format
+    }
+    fn frame(&self, index: u64, pixels: &[u8]) -> Result<(), String> {
+        if self.fail_at == Some(index) {
+            return Err("the encoder went away".into());
+        }
+        self.got.lock().unwrap().push((index, pixels.to_vec()));
+        Ok(())
+    }
+}
+
+fn to_sink(p: &Project, cid: ItemId, sink: &Frames, path: &Path) -> Result<effectcraft_export::Report, effectcraft_export::ExportError> {
+    let (s, om) = (settings(), OutputModule::for_format(OutputFormat::H264));
+    let path = path.to_string_lossy().to_string();
+    let job = Job {
+        project: p,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &s,
+        output: &om,
+        path: &path,
+        sink: None,
+        options: JobOptions { frame_sink: Some(sink), ..Default::default() },
+        nested_switches: true,
+    };
+    export(&job, &mut |_| true)
+}
+
+/// A frame sink gets every frame of a movie job in order, as opaque RGBA or as the H.264
+/// encoder's I420, and no file is written; its error ends the export.
+#[test]
+fn frame_sinks_take_the_frames_instead_of_the_encoder() {
+    let d = out_dir("frame-sink");
+    let (p, cid) = project(None);
+    let path = d.join("never.mp4");
+    let rgba = Frames { format: FrameFormat::Rgba8, got: Default::default(), fail_at: None };
+    let r = to_sink(&p, cid, &rgba, &path).expect("export");
+    assert_eq!((r.frames, r.bytes, r.audio), (FRAMES, 0, false));
+    assert!(!path.exists(), "no movie is written");
+    let got = rgba.got.into_inner().unwrap();
+    assert_eq!(got.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (0..FRAMES).collect::<Vec<_>>());
+    for (k, px) in &got {
+        assert_eq!(px.len(), (W * H * 4) as usize);
+        check_frame(&Image::from_rgba8(W, H, px), *k, 0.01);
+    }
+    let i420 = Frames { format: FrameFormat::I420, got: Default::default(), fail_at: None };
+    to_sink(&p, cid, &i420, &path).expect("export");
+    let planes = i420.got.into_inner().unwrap();
+    assert_eq!(planes.len(), FRAMES as usize);
+    let (luma, chroma) = ((W * H) as usize, (W.div_ceil(2) * H.div_ceil(2)) as usize);
+    for ((_, yuv), (k, _)) in planes.iter().zip(&got) {
+        assert_eq!(yuv.len(), luma + 2 * chroma);
+        // The centre's luma: BT.709 limited range of the background, then of pure red.
+        let y = yuv[(H / 2 * W + W / 2) as usize];
+        let want = if *k >= 5 { 16.0 + 219.0 * 0.2126 } else { 16.0 + 219.0 * (0.2126 * 0.1 + 0.7152 * 0.1 + 0.0722 * 0.4) };
+        assert!((y as f64 - want).abs() <= 1.0, "frame {k}: Y {y}, want {want:.1}");
+    }
+    let failing = Frames { format: FrameFormat::I420, got: Default::default(), fail_at: Some(3) };
+    let err = to_sink(&p, cid, &failing, &path).expect_err("the sink's error ends the export");
+    assert!(err.to_string().contains("the encoder went away"), "{err}");
+    assert_eq!(failing.got.into_inner().unwrap().len(), 3, "frames after the error are not handed over");
 }
 
 #[test]

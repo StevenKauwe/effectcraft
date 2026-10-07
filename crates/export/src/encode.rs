@@ -270,6 +270,24 @@ pub(crate) fn pcm_bytes(buf: &[f32], fmt: AudioFormat, big_endian: bool) -> Vec<
 
 // ---------------------------------------------------------------- the movie
 
+/// A movie job's frames handed in order to the host's [`crate::FrameSink`] instead of encoded.
+pub(crate) async fn to_sink(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>, sink: &dyn crate::FrameSink) -> Result<Report> {
+    let format = sink.format();
+    let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> {
+        let px = job.pixels(&img, comp, Channels::Rgb, w, h);
+        match format {
+            crate::FrameFormat::Rgba8 => px,
+            crate::FrameFormat::I420 => i420(&px, w, h),
+        }
+    };
+    job.stream(comp, (0..st.total).collect(), 2 * batch_size() as usize, render, |k, px| {
+        sink.frame(k, &px).map_err(ExportError::Encode)?;
+        st.advance(1)
+    })
+    .await?;
+    Ok(Report { path: job.path.to_string(), frames: 0, width: w, height: h, seconds: 0.0, bytes: 0, audio: false, log: None, overflow: vec![] })
+}
+
 type Writer<'f, 's> = Mp4Writer<&'f mut crate::out::Out<'s>>;
 
 pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) -> Result<Report> {
