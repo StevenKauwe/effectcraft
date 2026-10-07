@@ -58,8 +58,12 @@ pub(crate) struct State {
     renderer: OnceLock<Option<Mutex<vello::Renderer>>>,
     cache: Mutex<Cache>,
     targets: Mutex<Targets>,
+    /// How often each full content key missed the cache (see [`State::recurring`]).
+    misses: Mutex<HashMap<u64, u32>>,
     /// Shape layer sources rasterised here (diagnostics, tests).
     pub(crate) drawn: AtomicU64,
+    /// Pixels of those sources (tests).
+    pub(crate) drawn_px: AtomicU64,
     /// vello targets created, not taken from the pool (tests).
     pub(crate) targets_made: AtomicU64,
 }
@@ -92,6 +96,19 @@ impl State {
                 c.bytes -= old.width as usize * old.height as usize * 16;
             }
         }
+    }
+
+    /// Count a miss of a layer's full content key: true from the third miss on, when the same
+    /// content keeps being wanted (it is static; only what shows of it changed), so drawing
+    /// all of it once is cheaper than drawing each crop.
+    pub(crate) fn recurring(&self, key: u64) -> bool {
+        let Ok(mut m) = self.misses.lock() else { return false };
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        let n = m.entry(key).or_insert(0);
+        *n += 1;
+        *n >= 3
     }
 
     pub(crate) fn clear(&self) {
@@ -259,5 +276,6 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
     e.recycle_after_submit(target);
     out.levels = levels;
     e.g.vector.drawn.fetch_add(1, Ordering::Relaxed);
+    e.g.vector.drawn_px.fetch_add(w as u64 * h as u64, Ordering::Relaxed);
     Some(out)
 }

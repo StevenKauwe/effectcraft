@@ -183,6 +183,34 @@ fn floor_through_a_window() -> Scene {
     s
 }
 
+/// A large shape layer is drawn only where the frame can see it, widened by its effects' reach:
+/// fewer pixels, the same frame. Its third miss draws it whole (static content under a moving
+/// camera), and that frame is the same too.
+#[test]
+fn large_shape_layers_draw_only_what_shows() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = floor_through_a_window();
+    let Some(g) = gpu() else { return };
+    let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..RenderOpts::default() });
+    r.accel = Some(g);
+    let v = &g.context().vector;
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        g.context().clear_uploads();
+        let before = v.drawn_px.load(Relaxed);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        frames.push((img, v.drawn_px.load(Relaxed) - before));
+    }
+    let (cropped, cropped_px) = &frames[0];
+    let (whole, whole_px) = &frames[2];
+    assert_eq!(frames[1].1, *cropped_px, "the second miss is cropped too");
+    assert!(*cropped_px * 5 < *whole_px * 4, "cropped {cropped_px} px, whole {whole_px} px");
+    assert_eq!(cropped.data, whole.data, "the crop draws the same frame as the whole layer");
+    let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..RenderOpts::default() }).comp_frame_cpu(s.cid, Tick::ZERO);
+    let (mean, over16) = perceptual(&cpu, cropped);
+    assert!(mean <= 0.5 && over16 <= 0.005, "against the CPU: mean {mean:.3}, over 16 levels {:.3} %", over16 * 100.0);
+}
+
 /// vello targets come back to their pool once the work reading them is submitted, and not
 /// before: a target still to be read is never drawn over.
 #[test]

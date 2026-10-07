@@ -1234,6 +1234,33 @@ impl<'a> Renderer<'a> {
         shapes::scene(ctx, layer, layer.props.sub("contents")?, self.raster_scale(ctx, layer))
     }
 
+    /// How far (layer pixels) the layer's effect stack can move content: an output pixel depends
+    /// only on input pixels within this distance. Lets an accelerator draw just the part of a
+    /// large layer that shows (plus this margin). `None` when an effect's reach is not known.
+    pub fn effects_reach(&self, ctx: &EvalCtx, layer: &Layer) -> Option<f64> {
+        if !layer.switches.effects {
+            return Some(0.0);
+        }
+        let Some(fx) = layer.effects() else { return Some(0.0) };
+        let mut reach = 0.0;
+        for g in fx.groups().filter(|g| g.enabled) {
+            let GroupKind::Effect { effect } = &g.kind else { continue };
+            if effect.starts_with("ec.control.") || effectcraft_effects::audio_fx::is_audio_effect(effect) {
+                continue;
+            }
+            let p = self.effect_params(ctx, layer, g);
+            reach += match effect.as_str() {
+                // Box passes approximating the Gaussian reach ±3σ (σ = blurriness / 2).
+                "ec.blur.gaussian" => p.f("blurriness").max(0.0) * 1.5 + 2.0,
+                // Turbulent, Bulge, Twist and the Horizontal / Vertical / Cross kinds displace
+                // by the noise (fBm, |n| < 2) × Amount; the gradient kinds can go further.
+                "ec.distort.turbulentdisplace" if matches!(p.e("displacement"), 0 | 3 | 6 | 7 | 8) => p.f("amount").abs() * 2.0 + 2.0,
+                _ => return None,
+            };
+        }
+        Some(reach)
+    }
+
     /// The key [`Self::content_buf`] caches a layer's processed pixels under (source → masks →
     /// effects at this render's scale and time), for an accelerator's own cache of the same
     /// pixels. `None` when the content cannot be cached (expressions, time-dependent effects…).

@@ -254,25 +254,48 @@ fn draw_shape_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     if !matches!(layer.source, LayerSource::Shape) || styles::active(ctx, layer) || r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
         return None;
     }
-    let (mut img, offset, scale) = shape_content(e, r, ctx, layer)?;
+    let (mut img, offset, scale) = shape_content(e, r, ctx, layer, (canvas.width, canvas.height))?;
     if let Some(c) = r.pipe().to_blend() {
         img = ops::convert(e, &img, &c);
     }
-    // Placement reads only the buffer's size, offset and scale: an image without pixels.
-    let shell = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
-    let pl = r.placement(ctx, layer, &shell);
+    let pl = r.placement(ctx, layer, &shell(img.width, img.height, offset, scale));
     *canvas = place_image(e, &img, &pl, canvas, layer.blend_mode, opacity, r.pipe().levels);
     Some(())
 }
 
+/// A layer buffer without pixels: placement reads only its size, offset and scale.
+fn shell(width: u32, height: u32, offset: [f64; 2], scale: f64) -> Buf {
+    Buf { img: Image { width, height, data: Vec::new() }, offset, scale }
+}
+
 /// A shape layer's processed pixels on the GPU (source → effects), from the vector cache when
 /// its content key matches.
-fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<crate::vector::Content> {
-    let key = r.content_key_of(ctx, layer);
-    if let Some(hit) = key.and_then(|k| e.g.vector.get(k)) {
+///
+/// Shape layers are drawn at their content's full extent, often several times the frame (a
+/// world-space floor, a sky behind a camera move), and most layers change every drawing (the
+/// boil). So a layer that misses the cache is drawn only where the `view` (output pixels) can
+/// see it, widened by its effects' reach: the same buffer, cropped. A layer whose full key
+/// keeps coming back while its crop changes (static content under a moving camera) is drawn
+/// whole once and reused, unless the whole is much larger than what shows.
+fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, view: (u32, u32)) -> Option<crate::vector::Content> {
+    let full_key = r.content_key_of(ctx, layer);
+    if let Some(hit) = full_key.and_then(|k| e.g.vector.get(k)) {
         return Some(hit);
     }
-    let scene = r.shape_scene(ctx, layer)?;
+    let mut scene = r.shape_scene(ctx, layer)?;
+    let mut key = full_key;
+    if let Some(crop) = visible_crop(r, ctx, layer, &scene, view) {
+        let crop_key = full_key.map(|k| effectcraft_render::cache::derive(k, crop_bits(crop)));
+        if let Some(hit) = crop_key.and_then(|k| e.g.vector.get(k)) {
+            return Some(hit);
+        }
+        // Drawing all of a static layer pays off when it is not much larger than what shows.
+        let whole = (scene.width as u64 * scene.height as u64) <= 4 * crop[2] as u64 * crop[3] as u64;
+        if !(whole && full_key.is_some_and(|k| e.g.vector.recurring(k))) {
+            crop_scene(&mut scene, crop);
+            key = crop_key;
+        }
+    }
     let levels = r.pipe().levels;
     let img = crate::vector::rasterise(e, &scene, levels)?;
     let mut fx = crate::effects::GpuFx::new(e, img, scene.offset, scene.scale, levels);
@@ -282,6 +305,55 @@ fn shape_content(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Opt
         e.g.vector.insert(k, out.clone());
     }
     Some(out)
+}
+
+/// The part of a shape scene's buffer (x, y, width, height in buffer pixels) that can show in
+/// a `view`-sized output once placed, widened by the effects' reach and the resampling
+/// footprint. `None` when the whole buffer is needed or about as cheap (most of it shows,
+/// motion blur, an effect of unknown reach).
+fn visible_crop(r: &Renderer, ctx: &EvalCtx, layer: &Layer, sc: &effectcraft_render::shapes::ShapeScene, view: (u32, u32)) -> Option<[u32; 4]> {
+    let reach = r.effects_reach(ctx, layer)? * sc.scale + 3.0;
+    let pl = r.placement(ctx, layer, &shell(sc.width, sc.height, sc.offset, sc.scale));
+    let [m] = pl.matrices.as_slice() else { return None };
+    let inv = m.inverse()?;
+    let (vw, vh) = (view.0 as f64, view.1 as f64);
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in [(0.0, 0.0), (vw, 0.0), (0.0, vh), (vw, vh)] {
+        let p = inv.apply(effectcraft_geom::vec2(x, y));
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+    }
+    let (w, h) = (sc.width as f64, sc.height as f64);
+    // The crop starts on vello's 16-pixel tile grid, so every tile sees the same coordinates
+    // as in the whole buffer and draws the same pixels (off the grid, f32 rounding flips a
+    // level here and there).
+    let cx0 = ((x0 - reach) / 16.0).floor().clamp(0.0, w) * 16.0;
+    let cy0 = ((y0 - reach) / 16.0).floor().clamp(0.0, h) * 16.0;
+    let cx1 = (x1 + reach).ceil().clamp(0.0, w);
+    let cy1 = (y1 + reach).ceil().clamp(0.0, h);
+    let (cw, ch) = ((cx1 - cx0).max(1.0), (cy1 - cy0).max(1.0));
+    if cw * ch > 0.8 * w * h {
+        return None;
+    }
+    Some([cx0 as u32, cy0 as u32, cw as u32, ch as u32])
+}
+
+fn crop_bits(c: [u32; 4]) -> u64 {
+    (c[0] as u64) | (c[1] as u64) << 16 | (c[2] as u64) << 32 | (c[3] as u64) << 48
+}
+
+/// Restrict a scene to a sub-rectangle of its buffer: the same pixels there, with the buffer's
+/// origin moved to the rectangle's corner.
+fn crop_scene(sc: &mut effectcraft_render::shapes::ShapeScene, c: [u32; 4]) {
+    let shift = effectcraft_geom::Mat3::translate(effectcraft_geom::vec2(-(c[0] as f64), -(c[1] as f64)));
+    sc.offset = [sc.offset[0] - c[0] as f64, sc.offset[1] - c[1] as f64];
+    sc.width = c[2];
+    sc.height = c[3];
+    for d in &mut sc.draws {
+        d.to_px = shift * d.to_px;
+    }
 }
 
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
