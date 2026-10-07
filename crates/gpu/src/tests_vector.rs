@@ -161,3 +161,55 @@ fn shape_layers_rasterise_on_the_gpu_like_the_cpu() {
         }
     }
 }
+
+/// A shape layer larger than the frame (a floor seen through a window), with Turbulent
+/// Displace and Gaussian Blur, at the 8-bit depth and a fractional position.
+fn floor_through_a_window() -> Scene {
+    let mut s = Scene::new(BitDepth::Bpc8);
+    let mut floor = shape_layer(&mut s, "floor", |ids| {
+        let mut gs = Vec::new();
+        for k in 0..24 {
+            let (x, y) = ((k % 6) as f64 * 40.0 + 20.0, (k / 6) as f64 * 45.0 + 22.0);
+            let c = [0.2 + 0.03 * k as f64, 0.5, 0.9 - 0.03 * k as f64, 1.0];
+            let items = vec![build::shape_ellipse(ids, [30.0, 26.0], [0.0, 0.0]), build::shape_fill(ids, c)];
+            gs.push(group(ids, "dab", items, k as f64 * 7.0, [x, y]));
+        }
+        gs
+    });
+    s.effect(&mut floor, "ec.distort.turbulentdisplace", &[("amount", Value::Scalar(12.0)), ("size", Value::Scalar(31.0)), ("complexity", Value::Scalar(2.0))]);
+    s.effect(&mut floor, "ec.blur.gaussian", &[("blurriness", Value::Scalar(6.0))]);
+    set(&mut floor, "transform/position", v3(-71.3, -58.6));
+    s.push(floor);
+    s
+}
+
+/// vello targets come back to their pool once the work reading them is submitted, and not
+/// before: a target still to be read is never drawn over.
+#[test]
+fn vello_targets_are_reused_after_submit() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let painted = painted(BitDepth::Bpc32, false);
+    let floor = floor_through_a_window();
+    let Some(g) = gpu() else { return };
+    g.context().clear_uploads();
+    let scene_of = |s: &Scene, name: &str| {
+        let r = Renderer::new(&s.p, &Pattern, RenderOpts::default());
+        let ctx = r.eval_ctx(s.cid, Tick::ZERO).expect("comp");
+        let layer = ctx.comp.layers.iter().find(|l| l.name == name).expect("layer");
+        r.shape_scene(&ctx, layer).expect("a shape scene")
+    };
+    let (a, b) = (scene_of(&painted, "ink"), scene_of(&floor, "floor"));
+    let v = &g.context().vector;
+    let mut e = crate::context::Enc::new(g.context());
+    let made = v.targets_made.load(Relaxed);
+    let first_a = crate::vector::rasterise(&mut e, &a, None).expect("vello");
+    let first_b = crate::vector::rasterise(&mut e, &b, None).expect("vello");
+    assert_eq!(v.targets_made.load(Relaxed) - made, 2, "a target is not reused before its reader is submitted");
+    e.submit();
+    let again_a = crate::vector::rasterise(&mut e, &a, None).expect("vello");
+    let again_b = crate::vector::rasterise(&mut e, &b, None).expect("vello");
+    assert_eq!(v.targets_made.load(Relaxed) - made, 2, "submitted targets are reused");
+    let read = |e: &mut crate::context::Enc, i| e.download(i).expect("readback").data;
+    assert_eq!(read(&mut e, &again_a), read(&mut e, &first_a));
+    assert_eq!(read(&mut e, &again_b), read(&mut e, &first_b));
+}

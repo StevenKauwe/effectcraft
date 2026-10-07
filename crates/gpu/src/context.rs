@@ -708,6 +708,8 @@ pub(crate) struct Enc<'g> {
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
     pending: usize,
+    /// vello targets read by recorded work: back to their pool once it is submitted.
+    recycle: Vec<wgpu::Texture>,
 }
 
 impl Drop for Enc<'_> {
@@ -718,12 +720,13 @@ impl Drop for Enc<'_> {
         {
             p.close(id);
         }
+        self.g.vector.recycle(std::mem::take(&mut self.recycle));
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0 }
+        Enc { g, enc: None, pending: 0, recycle: Vec::new() }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -890,6 +893,12 @@ impl<'g> Enc<'g> {
             }
         }
         self.pending = 0;
+        self.g.vector.recycle(std::mem::take(&mut self.recycle));
+    }
+
+    /// Hand a vello target back to its pool once the work recorded so far is submitted.
+    pub(crate) fn recycle_after_submit(&mut self, t: wgpu::Texture) {
+        self.recycle.push(t);
     }
 
     /// Read an image back to the CPU (submits and waits). `None` where readback is impossible.

@@ -40,14 +40,28 @@ struct Cache {
     clock: u64,
 }
 
-/// The vello renderer (built on first use; `None` when it could not be built on this device)
-/// and the processed-layer cache.
+/// vello targets are pooled by size rounded up to this many pixels.
+const TARGET_STEP: u32 = 64;
+/// RGBA8 targets kept for reuse (bytes).
+const TARGET_BUDGET: usize = 256 << 20;
+
+#[derive(Default)]
+struct Targets {
+    free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
+    bytes: usize,
+}
+
+/// The vello renderer (built on first use; `None` when it could not be built on this device),
+/// the processed-layer cache and the pool of vello targets.
 #[derive(Default)]
 pub(crate) struct State {
     renderer: OnceLock<Option<Mutex<vello::Renderer>>>,
     cache: Mutex<Cache>,
+    targets: Mutex<Targets>,
     /// Shape layer sources rasterised here (diagnostics, tests).
     pub(crate) drawn: AtomicU64,
+    /// vello targets created, not taken from the pool (tests).
+    pub(crate) targets_made: AtomicU64,
 }
 
 impl State {
@@ -84,6 +98,46 @@ impl State {
         if let Ok(mut c) = self.cache.lock() {
             c.map.clear();
             c.bytes = 0;
+        }
+        if let Ok(mut t) = self.targets.lock() {
+            t.free.clear();
+            t.bytes = 0;
+        }
+    }
+
+    /// An RGBA8 storage texture at least `w × h` (pooled; contents undefined).
+    fn target(&self, device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+        let size = (w.div_ceil(TARGET_STEP) * TARGET_STEP, h.div_ceil(TARGET_STEP) * TARGET_STEP);
+        if let Ok(mut t) = self.targets.lock()
+            && let Some(tex) = t.free.get_mut(&size).and_then(Vec::pop)
+        {
+            t.bytes -= size.0 as usize * size.1 as usize * 4;
+            return tex;
+        }
+        self.targets_made.fetch_add(1, Ordering::Relaxed);
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vello shape layer"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
+    /// Return targets whose last reader has been submitted (or discarded): work vello submits
+    /// later runs after it on the queue.
+    pub(crate) fn recycle(&self, textures: Vec<wgpu::Texture>) {
+        let Ok(mut t) = self.targets.lock() else { return };
+        for tex in textures {
+            let bytes = tex.width() as usize * tex.height() as usize * 4;
+            if t.bytes + bytes > TARGET_BUDGET {
+                continue;
+            }
+            t.bytes += bytes;
+            t.free.entry((tex.width(), tex.height())).or_default().push(tex);
         }
     }
 
@@ -184,16 +238,8 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
         let (b, bt) = brush(&d.paint, d.opacity);
         scene.fill(rule, Affine::IDENTITY, &b, bt.map(|t| to_px * t), &path);
     }
-    let target = e.g.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("vello shape layer"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
+    // A pooled target may be larger than the buffer: vello draws its top-left w × h.
+    let target = e.g.vector.target(&e.g.device, w, h);
     let view = target.create_view(&Default::default());
     let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: w, height: h, antialiasing_method: vello::AaConfig::Area };
     {
@@ -209,7 +255,8 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
     let l = levels.unwrap_or(0.0);
     p.f[0] = [l, if l > 0.0 { 1.0 / l } else { 0.0 }, 0.0, 0.0];
     let mut out = e.scratch(w, h);
-    e.pixels("premultiply8", &p, &GpuImage::new(target, w, h), None, &out, None);
+    e.pixels("premultiply8", &p, &GpuImage::new(target.clone(), w, h), None, &out, None);
+    e.recycle_after_submit(target);
     out.levels = levels;
     e.g.vector.drawn.fetch_add(1, Ordering::Relaxed);
     Some(out)
