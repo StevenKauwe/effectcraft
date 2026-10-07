@@ -198,6 +198,12 @@ impl Pool {
     }
 }
 
+/// Size of [`Params`] in a uniform buffer.
+const PARAMS_BYTES: usize = 256;
+const PARAMS_SIZE: Option<std::num::NonZeroU64> = std::num::NonZeroU64::new(PARAMS_BYTES as u64);
+/// Kernel parameter slots per buffer (an encoder submits every 256 dispatches anyway).
+const PARAM_SLOTS: u64 = 256;
+
 /// Uniform parameter block shared by every kernel (see `shaders/common.wgsl`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Params {
@@ -744,6 +750,8 @@ pub(crate) struct Enc<'g> {
     /// A step whose output recorded work reads has failed (a vello render): the render is
     /// wrong and must not be used.
     pub(crate) failed: bool,
+    /// Parameter buffers of the recorded kernels and their bytes, written at submit.
+    params: Vec<(wgpu::Buffer, Vec<u8>)>,
 }
 
 impl Drop for Enc<'_> {
@@ -762,7 +770,7 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false }
+        Enc { g, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false, params: Vec::new() }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -845,7 +853,7 @@ impl<'g> Enc<'g> {
             log::error!("gpu: no kernel {entry}");
             return;
         };
-        let ub = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &p.bytes(), usage: wgpu::BufferUsages::UNIFORM });
+        let (ub, offset) = self.param_slot(p);
         let sv = src.texture.create_view(&Default::default());
         let av = aux.map(|a| a.texture.create_view(&Default::default()));
         let ov = out.texture.create_view(&Default::default());
@@ -853,7 +861,7 @@ impl<'g> Enc<'g> {
             label: None,
             layout: &g.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &ub, offset, size: PARAMS_SIZE }) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(av.as_ref().unwrap_or(&g.dummy_tex)) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ov) },
@@ -889,6 +897,41 @@ impl<'g> Enc<'g> {
         }
     }
 
+    /// A slot for a kernel's parameters: (buffer, offset). The bytes are written to the
+    /// buffer just before the next submit; a buffer created for every dispatch took a lock
+    /// every other thread's GPU work contended for.
+    fn param_slot(&mut self, p: &Params) -> (wgpu::Buffer, u64) {
+        let stride = (PARAMS_BYTES as u64).max(self.g.device.limits().min_uniform_buffer_offset_alignment as u64);
+        let full = self.params.last().is_none_or(|(_, bytes)| bytes.len() as u64 + stride > stride * PARAM_SLOTS);
+        if full {
+            let buf = self.g.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kernel params"),
+                size: stride * PARAM_SLOTS,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.params.push((buf, Vec::with_capacity((stride * PARAM_SLOTS) as usize)));
+        }
+        match self.params.last_mut() {
+            Some((buf, bytes)) => {
+                let offset = bytes.len() as u64;
+                bytes.extend_from_slice(&p.bytes());
+                bytes.resize((offset + stride) as usize, 0);
+                (buf.clone(), offset)
+            }
+            None => (
+                self.g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &p.bytes(), usage: wgpu::BufferUsages::UNIFORM }),
+                0,
+            ),
+        }
+    }
+
+    /// Parameter buffers waiting to be written at the next submit (tests).
+    #[cfg(test)]
+    pub(crate) fn param_buffers(&self) -> usize {
+        self.params.len()
+    }
+
     /// Run a pipeline that has its own bind group layout (plug-in kernels, `fx_plugin`).
     pub(crate) fn dispatch_with(&mut self, label: &str, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, groups: (u32, u32)) {
         let enc = self.encoder();
@@ -920,9 +963,13 @@ impl<'g> Enc<'g> {
         );
     }
 
-    /// Submit recorded work (after rendering the shape layers it reads).
+    /// Submit recorded work (after rendering the shape layers it reads and writing the kernels'
+    /// parameters).
     pub fn submit(&mut self) {
         crate::vector::flush(self);
+        for (buf, bytes) in self.params.drain(..) {
+            self.g.queue.write_buffer(&buf, 0, &bytes);
+        }
         if let Some((enc, id)) = self.enc.take() {
             self.g.queue.submit([enc.finish()]);
             if let Ok(mut p) = self.g.pool.lock() {

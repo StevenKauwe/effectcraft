@@ -707,3 +707,24 @@ fn kernels_build_on_first_use() {
     assert_eq!(g.ctx.build_all_kernels(), all);
     assert_eq!(g.ctx.kernels_built(), (all, all));
 }
+
+/// Kernels recorded between two submits keep their parameters in one shared buffer, written at
+/// the submit; each kernel still sees its own.
+#[test]
+fn kernel_parameters_share_a_buffer_per_submit() {
+    let Some(g) = gpu() else { return };
+    let mut e = crate::context::Enc::new(&g.ctx);
+    let img = g.ctx.upload_image(&pattern(3, 8, 8)).expect("upload");
+    let levels = [255.0f32, 15.0, 3.0];
+    let outs: Vec<_> = levels.iter().map(|&l| crate::ops::quantize(&mut e, &img, l)).collect();
+    assert_eq!(e.param_buffers(), 1);
+    for (out, l) in outs.iter().zip(levels) {
+        let got = e.download(out).expect("readback");
+        assert_eq!(e.param_buffers(), 0, "written at the submit");
+        let mut want = pattern(3, 8, 8);
+        want.quantize(l);
+        // The kernel multiplies by the CPU-rounded reciprocal: equal within a few ulps.
+        let worst = got.data.iter().flatten().zip(want.data.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(worst < 1e-6, "{l} levels: off by {worst}");
+    }
+}
