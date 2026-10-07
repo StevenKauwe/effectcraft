@@ -81,6 +81,8 @@ impl State {
     }
 
     pub(crate) fn insert(&self, key: u64, content: Content) {
+        // Other frames' encoders will read it.
+        content.0.share();
         let Ok(mut c) = self.cache.lock() else { return };
         let bytes = content.0.width as usize * content.0.height as usize * 16;
         if bytes > CACHE_BUDGET / 4 {

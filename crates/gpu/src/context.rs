@@ -67,12 +67,24 @@ impl GpuImage {
     pub fn new(texture: wgpu::Texture, width: u32, height: u32) -> GpuImage {
         GpuImage { texture, width, height, _lease: None, levels: None }
     }
+
+    /// Mark the image as readable by other encoders (it goes into a cache): once released, its
+    /// texture waits for every open encoder instead of going straight back to its own.
+    pub(crate) fn share(&self) {
+        if let Some(l) = &self._lease {
+            l.shared.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// Hands a pooled texture back to its [`Pool`] when the last [`GpuImage`] holding it drops.
 struct Lease {
     texture: wgpu::Texture,
     pool: Weak<Mutex<Pool>>,
+    /// The [`Enc`] that took it from the pool.
+    owner: u64,
+    /// Other encoders may have read it ([`GpuImage::share`]).
+    shared: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Lease {
@@ -86,7 +98,7 @@ impl Drop for Lease {
         if let Some(pool) = self.pool.upgrade()
             && let Ok(mut p) = pool.lock()
         {
-            p.release(self.texture.clone());
+            p.release_from(self.texture.clone(), self.owner, self.shared.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 }
@@ -98,9 +110,17 @@ impl Drop for Lease {
 /// submitted yet. Reusing it in another encoder that is submitted first would overwrite it
 /// before those reads run, so a released texture waits until every encoder that was open when
 /// it was released has been submitted (or dropped).
+///
+/// The encoder that took a texture can reuse it as soon as it is released, though: its own
+/// commands run in the order recorded. So a texture only that [`Enc`] used goes back to the
+/// Enc's own free list, and to the shared one when the Enc is done. With frames rendering on
+/// several threads, some encoder is always open, and textures waiting for all of them were
+/// mostly dropped over budget and created again: a hundred textures a 1080p frame.
 #[derive(Default)]
 pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
+    /// Per live [`Enc`]: textures it released that only it used.
+    local: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
     /// Encoders with recorded, unsubmitted work.
@@ -144,6 +164,25 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 }
 
 impl Pool {
+    fn release_from(&mut self, t: wgpu::Texture, owner: u64, shared: bool) {
+        match self.local.get_mut(&owner) {
+            Some(l) if !shared => l.entry((t.width(), t.height())).or_default().push(t),
+            _ => self.release(t),
+        }
+    }
+
+    /// An [`Enc`] starts: it gets a free list of its own.
+    fn enc_begin(&mut self, owner: u64) {
+        self.local.insert(owner, HashMap::new());
+    }
+
+    /// An [`Enc`] is done (its work submitted or discarded): what only it used is free for all.
+    fn enc_end(&mut self, owner: u64) {
+        for t in self.local.remove(&owner).into_iter().flat_map(HashMap::into_values).flatten() {
+            self.make_free(t);
+        }
+    }
+
     fn release(&mut self, t: wgpu::Texture) {
         match self.open.last() {
             Some(&newest) => self.released.push((t, newest)),
@@ -180,7 +219,11 @@ impl Pool {
         }
     }
 
-    fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
+    fn take(&mut self, w: u32, h: u32, owner: u64) -> Option<wgpu::Texture> {
+        if let Some(t) = self.local.get_mut(&owner).and_then(|l| l.get_mut(&(w, h))).and_then(Vec::pop) {
+            self.hits += 1;
+            return Some(t);
+        }
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         match &t {
             Some(t) => {
@@ -650,14 +693,14 @@ impl GpuContext {
         })
     }
 
-    /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
-    /// one is zeroed.
-    fn pooled(&self, w: u32, h: u32) -> (GpuImage, bool) {
+    /// A pooled working texture for [`Enc`] `owner`: (image, reused). A reused texture holds old
+    /// pixels; a new one is zeroed.
+    fn pooled(&self, w: u32, h: u32, owner: u64) -> (GpuImage, bool) {
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
+        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h, owner));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
-        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
+        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool), owner, shared: Default::default() });
         (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
     }
 
@@ -760,6 +803,8 @@ impl GpuContext {
 /// Records GPU work for one render (a command encoder submitted at readback or the end).
 pub(crate) struct Enc<'g> {
     pub g: &'g GpuContext,
+    /// This Enc's id in the texture pool (its own free list).
+    id: u64,
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
     pending: usize,
@@ -785,12 +830,20 @@ impl Drop for Enc<'_> {
         let mut done = std::mem::take(&mut self.recycle);
         done.extend(self.atlas.discard());
         self.g.vector.recycle(done);
+        if let Ok(mut p) = self.g.pool.lock() {
+            p.enc_end(self.id);
+        }
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false, params: Vec::new() }
+        static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut p) = g.pool.lock() {
+            p.enc_begin(id);
+        }
+        Enc { g, id, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false, params: Vec::new() }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -806,7 +859,7 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, reused) = self.g.pooled(w, h);
+        let (img, reused) = self.g.pooled(w, h, self.id);
         if reused {
             self.fill(&img, 0.0);
         }
@@ -816,7 +869,7 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h);
+        let (img, _) = self.g.pooled(w, h, self.id);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }

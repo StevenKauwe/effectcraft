@@ -778,3 +778,44 @@ fn readbacks_wait_without_holding_the_device_lock() {
     }
     assert!(worst * 4 < gpu_time, "a destroy took {worst:?} while a readback waited {gpu_time:?}");
 }
+
+/// A working texture an encoder releases is reused by that encoder at once, even with its
+/// readers recorded and not yet submitted (its commands run in order), but not by another
+/// open encoder (which could be submitted first and overwrite it before those reads), and not
+/// at all while it may be shared (a cached layer other encoders read). The result is still
+/// right.
+#[test]
+fn working_textures_are_reused_within_an_encoder() {
+    let Some(g) = gpu() else { return };
+    let ctx = &g.ctx;
+    let src = ctx.upload_image(&pattern(5, 40, 24)).expect("upload");
+    let mut e = crate::context::Enc::new(ctx);
+    let mut other = crate::context::Enc::new(ctx);
+    // A texture `e` reads in recorded work, then releases.
+    let a = crate::ops::quantize(&mut e, &src, 255.0);
+    let first = crate::ops::quantize(&mut e, &a, 15.0);
+    let a_tex = a.texture.clone();
+    drop(a);
+    let b = other.scratch(40, 24);
+    assert!(b.texture != a_tex, "another open encoder must not get a texture with unsubmitted readers");
+    let c = e.scratch(40, 24);
+    assert!(c.texture == a_tex, "the releasing encoder reuses it");
+    // A shared texture is not reused, even by its own encoder.
+    let shared = crate::ops::quantize(&mut e, &src, 3.0);
+    shared.share();
+    let shared_tex = shared.texture.clone();
+    drop(shared);
+    let d = e.scratch(40, 24);
+    assert!(d.texture != shared_tex, "a shared texture is not reused while encoders may read it");
+    // Overwriting the reused texture does not change what was computed from it.
+    let mut p = crate::context::Params::default();
+    p.f[0] = [9.0; 4];
+    e.pixels("fill", &p, &src, None, &c, None);
+    let mut want = pattern(5, 40, 24);
+    want.quantize(255.0);
+    want.quantize(15.0);
+    let got = e.download(&first).expect("readback");
+    let worst = got.data.iter().flatten().zip(want.data.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    assert!(worst < 1e-6, "off by {worst}");
+    drop((b, c, d));
+}
