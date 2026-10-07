@@ -339,6 +339,20 @@ fn edits_invalidate_cached_layers() {
     }
 }
 
+/// Layer structure hashes are remembered per comp: an edit made in place on the only copy of a
+/// project (no clone, as an editor does) must still re-render the edited layer.
+#[test]
+fn in_place_edits_invalidate_remembered_structure() {
+    let (mut p, cid) = cache_scene();
+    let t = Tick::from_seconds_f64(0.5);
+    let cache = crate::LayerCache::default();
+    let orig = render_cached(&p, cid, t, Some(&cache));
+    p.comp_mut(cid).unwrap().layers[2].props.prop_mut("effects/#1/white").unwrap().value = Value::Color([0.0, 1.0, 0.0, 1.0]);
+    let cached = render_cached(&p, cid, t, Some(&cache));
+    assert_same(&cached, &render_cached(&p, cid, t, None), "edited in place");
+    assert!(orig.data.iter().zip(&cached.data).any(|(a, b)| (a[0] - b[0]).abs() > 1e-3), "the edit shows");
+}
+
 #[test]
 fn time_dependent_effects_rerender_every_frame() {
     let (mut p, cid, comp) = setup();

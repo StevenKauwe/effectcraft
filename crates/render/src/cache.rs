@@ -418,6 +418,61 @@ fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     Hasher::write_u8(h, 0xff);
 }
 
+/// Transform is applied later; Layer Styles are keyed separately (see [`styles_key`]).
+fn keyed_group(g: &PropGroup) -> bool {
+    g.match_id != "transform" && g.match_id != effectcraft_project::styles::GROUP
+}
+
+/// Distinct comps whose layers' structure hashes are remembered.
+const STRUCTURE_COMPS: usize = 32;
+
+/// Structure hashes by comp: each entry holds its comp, so the comp cannot be edited in place
+/// (`Arc::make_mut` clones a shared comp) and a pointer match means the same, unchanged layers.
+static STRUCTURE: Mutex<Vec<(Arc<effectcraft_project::Comp>, HashMap<effectcraft_project::LayerId, u64>)>> = Mutex::new(Vec::new());
+
+/// The hash of a layer's static structure (every keyed group's `Debug` form: values, keyframes,
+/// expressions, switches, effect ids). Formatting every keyframe is the costly part of a key and
+/// the structure does not change from frame to frame, so it is remembered per comp.
+fn structure_hash(ctx: &EvalCtx, layer: &Layer) -> u64 {
+    let compute = || {
+        let mut h = KeyHasher(0x84222325_cbf29ce4);
+        for c in &layer.props.children {
+            if let Node::Group(g) = c
+                && !keyed_group(g)
+            {
+                continue;
+            }
+            hash_debug(&mut h, c);
+        }
+        h.finish()
+    };
+    let arc = match ctx.project.item(ctx.comp_id).map(|i| &i.kind) {
+        Some(ItemKind::Comp(c)) if std::ptr::eq(Arc::as_ptr(c), ctx.comp) && ctx.comp.layer(layer.id).is_some_and(|l| std::ptr::eq(l, layer)) => c,
+        _ => return compute(),
+    };
+    if let Ok(memo) = STRUCTURE.lock()
+        && let Some((_, m)) = memo.iter().find(|(c, _)| Arc::ptr_eq(c, arc))
+        && let Some(k) = m.get(&layer.id)
+    {
+        return *k;
+    }
+    let k = compute();
+    if let Ok(mut memo) = STRUCTURE.lock() {
+        match memo.iter().position(|(c, _)| Arc::ptr_eq(c, arc)) {
+            Some(i) => {
+                memo[i].1.insert(layer.id, k);
+            }
+            None => {
+                if memo.len() >= STRUCTURE_COMPS {
+                    memo.remove(0);
+                }
+                memo.push((arc.clone(), HashMap::from([(layer.id, k)])));
+            }
+        }
+    }
+    k
+}
+
 /// Time-based layer content: does any part of the source/effects read the clock directly
 /// (rather than through property values)?
 fn time_dependent(layer: &Layer) -> bool {
@@ -568,16 +623,12 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         ctx.comp.shutter_phase.to_bits().hash(&mut h);
         ctx.comp.motion_blur_samples.hash(&mut h);
     }
+    // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.
+    structure_hash(ctx, layer).hash(&mut h);
     for c in &layer.props.children {
-        // Transform is applied later; Layer Styles are keyed separately (see [`styles_key`]).
         if let Node::Group(g) = c
-            && (g.match_id == "transform" || g.match_id == effectcraft_project::styles::GROUP)
+            && keyed_group(g)
         {
-            continue;
-        }
-        // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.
-        hash_debug(&mut h, c);
-        if let Node::Group(g) = c {
             hash_values(&mut h, ctx, layer, g);
         }
     }
