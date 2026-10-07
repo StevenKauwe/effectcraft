@@ -183,7 +183,7 @@ fn quantize(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Straight RGBA8 (a vello target) → premultiplied, clamped and quantised when levels > 0.
-// f[0] = (levels, 1 / levels)
+// f[0] = (levels, 1 / levels), u[0].xy = where the output's top-left is in `src` (an atlas)
 @compute @workgroup_size(16, 16)
 fn premultiply8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -191,7 +191,7 @@ fn premultiply8(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    let s = textureLoad(src, p, 0);
+    let s = textureLoad(src, p + vec2<i32>(P.u[0].xy), 0);
     store_q(p, vec4<f32>(s.xyz * s.w, s.w), P.f[0].x, P.f[0].y);
 }
 

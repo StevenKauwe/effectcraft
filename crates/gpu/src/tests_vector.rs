@@ -149,8 +149,11 @@ fn shape_layers_rasterise_on_the_gpu_like_the_cpu() {
             let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts });
             r.accel = Some(g);
             let before = g.context().shape_layers_drawn();
+            let renders = g.context().vector.renders.load(std::sync::atomic::Ordering::Relaxed);
             let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
             assert_eq!(g.context().shape_layers_drawn() - before, 3, "{depth:?} collapse {collapse}: every shape layer rasterised on the GPU");
+            let renders = g.context().vector.renders.load(std::sync::atomic::Ordering::Relaxed) - renders;
+            assert_eq!(renders, 1, "{depth:?} collapse {collapse}: the frame's shape layers share one vello render");
             let (mean, over16) = perceptual(&cpu, &img);
             eprintln!("{depth:?} collapse {collapse}: mean {mean:.3} levels, {:.3} % of pixels over 16 levels", over16 * 100.0);
             assert!(mean <= 0.5 && over16 <= 0.005, "{depth:?} collapse {collapse}: mean {mean:.3}, over 16 levels {:.3} %", over16 * 100.0);
@@ -212,7 +215,8 @@ fn large_shape_layers_draw_only_what_shows() {
 }
 
 /// vello targets come back to their pool once the work reading them is submitted, and not
-/// before: a target still to be read is never drawn over.
+/// before: a target still to be read is never drawn over. The layers an encoder draws share
+/// one target (its atlas).
 #[test]
 fn vello_targets_are_reused_after_submit() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -228,16 +232,23 @@ fn vello_targets_are_reused_after_submit() {
     };
     let (a, b) = (scene_of(&painted, "ink"), scene_of(&floor, "floor"));
     let v = &g.context().vector;
+    let made = || v.targets_made.load(Relaxed);
+    let before = made();
     let mut e = crate::context::Enc::new(g.context());
-    let made = v.targets_made.load(Relaxed);
     let first_a = crate::vector::rasterise(&mut e, &a, None).expect("vello");
     let first_b = crate::vector::rasterise(&mut e, &b, None).expect("vello");
-    assert_eq!(v.targets_made.load(Relaxed) - made, 2, "a target is not reused before its reader is submitted");
+    assert_eq!(made() - before, 1, "an encoder's layers share one atlas");
+    let mut other = crate::context::Enc::new(g.context());
+    let other_b = crate::vector::rasterise(&mut other, &b, None).expect("vello");
+    assert_eq!(made() - before, 2, "an atlas is not reused before its reader is submitted");
     e.submit();
     let again_a = crate::vector::rasterise(&mut e, &a, None).expect("vello");
     let again_b = crate::vector::rasterise(&mut e, &b, None).expect("vello");
-    assert_eq!(v.targets_made.load(Relaxed) - made, 2, "submitted targets are reused");
+    assert_eq!(made() - before, 2, "a submitted atlas is reused");
     let read = |e: &mut crate::context::Enc, i| e.download(i).expect("readback").data;
-    assert_eq!(read(&mut e, &again_a), read(&mut e, &first_a));
-    assert_eq!(read(&mut e, &again_b), read(&mut e, &first_b));
+    let (fa, fb) = (read(&mut e, &first_a), read(&mut e, &first_b));
+    assert_eq!(read(&mut e, &again_a), fa);
+    assert_eq!(read(&mut e, &again_b), fb);
+    assert_eq!(read(&mut other, &other_b), fb, "a layer draws the same pixels anywhere in an atlas");
+    assert!(!e.failed && !other.failed);
 }

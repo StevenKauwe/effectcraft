@@ -739,6 +739,11 @@ pub(crate) struct Enc<'g> {
     pending: usize,
     /// vello targets read by recorded work: back to their pool once it is submitted.
     recycle: Vec<wgpu::Texture>,
+    /// Shape layers waiting to be drawn by one vello render (rendered before each submit).
+    pub(crate) atlas: crate::vector::Atlas,
+    /// A step whose output recorded work reads has failed (a vello render): the render is
+    /// wrong and must not be used.
+    pub(crate) failed: bool,
 }
 
 impl Drop for Enc<'_> {
@@ -749,13 +754,15 @@ impl Drop for Enc<'_> {
         {
             p.close(id);
         }
-        self.g.vector.recycle(std::mem::take(&mut self.recycle));
+        let mut done = std::mem::take(&mut self.recycle);
+        done.extend(self.atlas.discard());
+        self.g.vector.recycle(done);
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, recycle: Vec::new() }
+        Enc { g, enc: None, pending: 0, recycle: Vec::new(), atlas: Default::default(), failed: false }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -913,8 +920,9 @@ impl<'g> Enc<'g> {
         );
     }
 
-    /// Submit recorded work.
+    /// Submit recorded work (after rendering the shape layers it reads).
     pub fn submit(&mut self) {
+        crate::vector::flush(self);
         if let Some((enc, id)) = self.enc.take() {
             self.g.queue.submit([enc.finish()]);
             if let Ok(mut p) = self.g.pool.lock() {

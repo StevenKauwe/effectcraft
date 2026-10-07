@@ -66,6 +66,8 @@ pub(crate) struct State {
     pub(crate) drawn_px: AtomicU64,
     /// vello targets created, not taken from the pool (tests).
     pub(crate) targets_made: AtomicU64,
+    /// vello renders (tests).
+    pub(crate) renders: AtomicU64,
 }
 
 impl State {
@@ -223,18 +225,63 @@ fn brush(paint: &ShapePaint, opacity: f32) -> (peniko::Brush, Option<Affine>) {
     }
 }
 
-/// Rasterise a shape scene into a premultiplied working image, clamped and quantised to
-/// `levels` when set. `None` = not handled here (no vello on this device, too large).
-pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Option<GpuImage> {
-    let (w, h) = (sc.width, sc.height);
-    if !e.g.fits(w, h) {
-        return None;
+/// Shape layers drawn by one encoder share vello renders: each goes into its own region of an
+/// atlas this many pixels square, and the atlas renders once, just before the encoder submits
+/// the work that reads it ([`flush`]). Each vello render creates and destroys textures, which
+/// takes a device-wide lock every other thread's submissions wait on; one render per layer
+/// made that lock the bottleneck of a shape-heavy frame.
+const ATLAS: u32 = 4096;
+/// Regions start on vello's 16-pixel tile grid, so a layer draws the same pixels anywhere.
+const TILE: u32 = 16;
+/// An atlas render keeps its estimated line segments and tiles under these: vello's buffers
+/// hold 2^21 of each, and an overflow would drop geometry silently.
+const ATLAS_SEGMENTS: usize = 1 << 20;
+const ATLAS_TILES: usize = 1 << 20;
+
+/// The atlas an encoder is filling ([`ATLAS`]).
+#[derive(Default)]
+pub(crate) struct Atlas(Option<Open>);
+
+struct Open {
+    scene: vello::Scene,
+    target: wgpu::Texture,
+    /// Shelf packing: the next region's x, the current row's top and height, and the extent used.
+    x: u32,
+    row_y: u32,
+    row_h: u32,
+    used: (u32, u32),
+    segments: usize,
+    tiles: usize,
+}
+
+impl Atlas {
+    /// Drop an atlas that was never rendered (its encoder was discarded unsubmitted).
+    pub(crate) fn discard(&mut self) -> Option<wgpu::Texture> {
+        self.0.take().map(|o| o.target)
     }
-    if sc.draws.is_empty() {
-        return Some(e.image(w, h));
+}
+
+/// A shape scene's draws as vello paths in buffer pixels, with estimates of the line
+/// segments and tiles vello will allocate for them.
+struct Paths {
+    fills: Vec<(Fill, peniko::Brush, Option<Affine>, BezPath)>,
+    segments: usize,
+    tiles: usize,
+}
+
+/// A line's points on a 1/256-pixel grid: exact in f32 at any atlas position (below 2^15
+/// pixels), so a layer's coverage does not depend on where its region is.
+fn snap(el: PathEl) -> PathEl {
+    let q = |p: Point| Point::new((p.x * 256.0).round() / 256.0, (p.y * 256.0).round() / 256.0);
+    match el {
+        PathEl::MoveTo(p) => PathEl::MoveTo(q(p)),
+        PathEl::LineTo(p) => PathEl::LineTo(q(p)),
+        other => other,
     }
-    let renderer = e.g.vector.renderer(&e.g.device)?;
-    let mut scene = vello::Scene::new();
+}
+
+fn paths(sc: &ShapeScene) -> Paths {
+    let (mut fills, mut segments, mut tiles) = (Vec::with_capacity(sc.draws.len()), 0usize, 0usize);
     for d in &sc.draws {
         // All of a draw's paths fill as one (their windings add), as on the CPU. Curves are
         // flattened here, in buffer pixels, finer than vello's own flattening: tiny-skia follows
@@ -243,37 +290,153 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
         let mut path = BezPath::new();
         for p in &d.paths {
             if p.elements().iter().all(|el| matches!(el, PathEl::MoveTo(_) | PathEl::LineTo(_) | PathEl::ClosePath)) {
-                path.extend(p.elements().iter().map(|el| to_px * *el));
+                path.extend(p.elements().iter().map(|el| snap(to_px * *el)));
             } else {
-                vello::kurbo::flatten(p.elements().iter().map(|el| to_px * *el), FLATTEN_TOLERANCE, |el| path.push(el));
+                vello::kurbo::flatten(p.elements().iter().map(|el| to_px * *el), FLATTEN_TOLERANCE, |el| path.push(snap(el)));
             }
+        }
+        // A line crosses about (|dx| + |dy|) / 16 tiles; a path allocates the tiles of its
+        // bounding box within the buffer.
+        let (mut last, mut lo, mut hi) = (Point::ZERO, Point::new(f64::MAX, f64::MAX), Point::new(f64::MIN, f64::MIN));
+        for el in path.elements() {
+            let p = match *el {
+                PathEl::MoveTo(p) => p,
+                PathEl::LineTo(p) => {
+                    segments += 1 + (((p.x - last.x).abs() + (p.y - last.y).abs()) / TILE as f64) as usize;
+                    p
+                }
+                _ => {
+                    segments += 1;
+                    continue;
+                }
+            };
+            (last, lo, hi) = (p, Point::new(lo.x.min(p.x), lo.y.min(p.y)), Point::new(hi.x.max(p.x), hi.y.max(p.y)));
+        }
+        let (bw, bh) = (hi.x.min(sc.width as f64) - lo.x.max(0.0), hi.y.min(sc.height as f64) - lo.y.max(0.0));
+        if bw > 0.0 && bh > 0.0 {
+            tiles += ((bw / TILE as f64).ceil() as usize + 1) * ((bh / TILE as f64).ceil() as usize + 1);
         }
         let rule = match d.rule {
             FillRule::NonZero => Fill::NonZero,
             FillRule::EvenOdd => Fill::EvenOdd,
         };
         let (b, bt) = brush(&d.paint, d.opacity);
-        scene.fill(rule, Affine::IDENTITY, &b, bt.map(|t| to_px * t), &path);
+        fills.push((rule, b, bt.map(|t| to_px * t), path));
     }
-    // A pooled target may be larger than the buffer: vello draws its top-left w × h.
-    let target = e.g.vector.target(&e.g.device, w, h);
-    let view = target.create_view(&Default::default());
-    let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: w, height: h, antialiasing_method: vello::AaConfig::Area };
-    {
-        // vello submits its own commands now, ahead of this encoder's: the kernel below,
-        // recorded here and submitted later, reads a finished texture.
-        let mut r = renderer.lock().ok()?;
-        if let Err(err) = r.render_to_texture(&e.g.device, &e.g.queue, &scene, &view, &params) {
-            log::warn!("gpu: vello: {err}");
+    Paths { fills, segments, tiles }
+}
+
+/// Render the encoder's open atlas now (vello submits its own commands, ahead of the encoder's
+/// that read the atlas). A failed render marks the encoder failed: its frame is then not used.
+pub(crate) fn flush(e: &mut Enc) {
+    let Some(o) = e.atlas.0.take() else { return };
+    let rendered = e.g.vector.renderer(&e.g.device).is_some_and(|renderer| {
+        let view = o.target.create_view(&Default::default());
+        let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: o.used.0, height: o.used.1, antialiasing_method: vello::AaConfig::Area };
+        let Ok(mut r) = renderer.lock() else { return false };
+        e.g.vector.renders.fetch_add(1, Ordering::Relaxed);
+        match r.render_to_texture(&e.g.device, &e.g.queue, &o.scene, &view, &params) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!("gpu: vello: {err}");
+                false
+            }
+        }
+    });
+    if !rendered {
+        e.failed = true;
+    }
+    e.recycle_after_submit(o.target);
+}
+
+/// A `w` × `h` region (top-left corner) for a layer in the encoder's atlas, flushing a full
+/// atlas and opening a new one as needed.
+fn place(e: &mut Enc, w: u32, h: u32, segments: usize, tiles: usize) -> (u32, u32) {
+    let fits = |o: &Open| -> Option<(u32, u32, bool)> {
+        if o.segments + segments > ATLAS_SEGMENTS || o.tiles + tiles > ATLAS_TILES {
             return None;
         }
+        if o.x + w <= ATLAS && o.row_y + h <= ATLAS {
+            return Some((o.x, o.row_y, false));
+        }
+        let y = o.row_y + o.row_h;
+        (w <= ATLAS && y + h <= ATLAS).then_some((0, y, true))
+    };
+    let spot = e.atlas.0.as_ref().and_then(fits);
+    let (x, y, new_row) = match spot {
+        Some(s) => s,
+        None => {
+            flush(e);
+            let target = e.g.vector.target(&e.g.device, ATLAS, ATLAS);
+            e.atlas.0 = Some(Open { scene: vello::Scene::new(), target, x: 0, row_y: 0, row_h: 0, used: (0, 0), segments: 0, tiles: 0 });
+            (0, 0, false)
+        }
+    };
+    if let Some(o) = e.atlas.0.as_mut() {
+        if new_row {
+            o.row_y = y;
+            o.row_h = 0;
+        }
+        o.x = (x + w).next_multiple_of(TILE);
+        o.row_h = o.row_h.max(h.next_multiple_of(TILE));
+        o.used = (o.used.0.max(x + w), o.used.1.max(y + h));
+        o.segments += segments;
+        o.tiles += tiles;
     }
+    (x, y)
+}
+
+/// Rasterise a shape scene into a premultiplied working image, clamped and quantised to
+/// `levels` when set. `None` = not handled here (no vello on this device, too large). The
+/// pixels are drawn when the encoder's atlas renders ([`flush`]).
+pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Option<GpuImage> {
+    let (w, h) = (sc.width, sc.height);
+    if !e.g.fits(w, h) {
+        return None;
+    }
+    if sc.draws.is_empty() {
+        return Some(e.image(w, h));
+    }
+    e.g.vector.renderer(&e.g.device)?;
+    let ps = paths(sc);
+    let (src, offset) = if w <= ATLAS && h <= ATLAS && ps.segments <= ATLAS_SEGMENTS && ps.tiles <= ATLAS_TILES {
+        let (x, y) = place(e, w, h, ps.segments, ps.tiles);
+        let o = e.atlas.0.as_mut()?;
+        let at = Affine::translate((x as f64, y as f64));
+        // Clipped to its region: a cropped layer's paths reach past it.
+        o.scene.push_clip_layer(Fill::NonZero, at, &vello::kurbo::Rect::new(0.0, 0.0, w as f64, h as f64));
+        for (rule, b, bt, path) in &ps.fills {
+            o.scene.fill(*rule, at, b, *bt, path);
+        }
+        o.scene.pop_layer();
+        (o.target.clone(), [x, y])
+    } else {
+        // Larger than an atlas: a render of its own, now.
+        let mut scene = vello::Scene::new();
+        for (rule, b, bt, path) in &ps.fills {
+            scene.fill(*rule, Affine::IDENTITY, b, *bt, path);
+        }
+        let target = e.g.vector.target(&e.g.device, w, h);
+        let view = target.create_view(&Default::default());
+        let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: w, height: h, antialiasing_method: vello::AaConfig::Area };
+        {
+            let renderer = e.g.vector.renderer(&e.g.device)?;
+            let mut r = renderer.lock().ok()?;
+            e.g.vector.renders.fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = r.render_to_texture(&e.g.device, &e.g.queue, &scene, &view, &params) {
+                log::warn!("gpu: vello: {err}");
+                return None;
+            }
+        }
+        e.recycle_after_submit(target.clone());
+        (target, [0, 0])
+    };
     let mut p = Params::default();
     let l = levels.unwrap_or(0.0);
     p.f[0] = [l, if l > 0.0 { 1.0 / l } else { 0.0 }, 0.0, 0.0];
+    p.u[0] = [offset[0], offset[1], 0, 0];
     let mut out = e.scratch(w, h);
-    e.pixels("premultiply8", &p, &GpuImage::new(target.clone(), w, h), None, &out, None);
-    e.recycle_after_submit(target);
+    e.pixels("premultiply8", &p, &GpuImage::new(src, w, h), None, &out, None);
     out.levels = levels;
     e.g.vector.drawn.fetch_add(1, Ordering::Relaxed);
     e.g.vector.drawn_px.fetch_add(w as u64 * h as u64, Ordering::Relaxed);

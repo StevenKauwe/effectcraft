@@ -184,7 +184,7 @@ impl Gpu {
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
         e.submit();
-        Some(DisplayFrame { texture, width: img.width, height: img.height })
+        (!e.failed).then_some(DisplayFrame { texture, width: img.width, height: img.height })
     }
 
     /// Read a display frame back as premultiplied RGBA8 (Info panel sampling, eyedroppers).
@@ -208,7 +208,8 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        e.download(&img)
+        let out = e.download(&img)?;
+        (!e.failed).then_some(out)
     }
 
     /// [`Gpu::render`] with deferred readbacks: the frame's readback is keyed by comp, time and
