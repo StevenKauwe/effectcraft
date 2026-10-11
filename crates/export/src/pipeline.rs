@@ -118,8 +118,8 @@ impl<'a> Cx<'a> {
     }
 
     /// Output frames `ks`, each mapped by `f` (encoding) and handed to `sink` in order on this
-    /// thread. Natively they render on the current rayon pool (the global pool from outside
-    /// one), at most `window` at a time, and each goes to `sink` as soon as it and every frame
+    /// thread. Natively they render on threads of their own (as many as the current rayon pool
+    /// has), at most `window` at a time, and each goes to `sink` as soon as it and every frame
     /// before it are done, so rendering never waits for a batch to finish while `sink` encodes.
     /// Deferred readbacks (and wasm) render one by one. An error from `sink` starts no more
     /// frames and is returned once the frames in flight are done.
@@ -133,7 +133,7 @@ impl<'a> Cx<'a> {
     ) -> Result<(), E> {
         #[cfg(not(target_arch = "wasm32"))]
         if !self.deferred() {
-            return self.stream_parallel(comp, &ks, window.max(1), &f, &mut sink);
+            return self.stream_parallel(&ks, window.max(1), &|k| f(k, self.frame(comp, k)), &mut sink);
         }
         for k in ks {
             let img = self.frame_async(comp, k).await;
@@ -145,13 +145,12 @@ impl<'a> Cx<'a> {
     #[cfg(not(target_arch = "wasm32"))]
     fn stream_parallel<T: Send, E>(
         &self,
-        comp: &Comp,
         ks: &[u64],
         window: usize,
-        f: &(impl Fn(u64, Image) -> T + Sync + Send),
+        render: &(impl Fn(u64) -> T + Sync + Send),
         sink: &mut impl FnMut(u64, T) -> Result<(), E>,
     ) -> Result<(), E> {
-        use std::sync::mpsc::{RecvTimeoutError, Sender, TryRecvError, channel};
+        use std::sync::mpsc::{Sender, channel};
         /// Reports a frame (`None` when rendering it panicked; the scope then re-raises the panic).
         struct Done<T: Send>(Sender<(usize, Option<T>)>, usize, Option<T>);
         impl<T: Send> Drop for Done<T> {
@@ -160,46 +159,50 @@ impl<'a> Cx<'a> {
             }
         }
         let (tx, rx) = channel::<(usize, Option<T>)>();
-        rayon::in_place_scope(|s| {
-            let start = |i: usize| {
-                let (tx, k) = (tx.clone(), ks[i]);
-                s.spawn(move |_| {
-                    let mut done = Done(tx, i, None);
-                    done.2 = Some(f(k, self.frame(comp, k)));
+        let (jobs_tx, jobs_rx) = channel::<usize>();
+        let jobs_rx = Mutex::new(jobs_rx);
+        // Frames render on threads of their own, not as tasks of the rayon pool. A frame's
+        // parallel loops run on the pool; a pool worker waiting for one of its loops takes other
+        // queued tasks meanwhile, and when frames were such tasks it took whole frames, each of
+        // which did the same. The frame the sink waited for ended up under a stack of later
+        // frames, and no more than about four frames' worth of work was ever in progress.
+        let threads = rayon::current_num_threads().min(window).min(ks.len()).max(1);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let (tx, jobs_rx) = (tx.clone(), &jobs_rx);
+                s.spawn(move || {
+                    loop {
+                        let next = jobs_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(i) = next else { break };
+                        let Some(&k) = ks.get(i) else { break };
+                        let mut done = Done(tx.clone(), i, None);
+                        done.2 = Some(render(k));
+                    }
                 });
-            };
+            }
+            drop(tx);
             let mut started = ks.len().min(window);
-            (0..started).for_each(&start);
+            for i in 0..started {
+                let _ = jobs_tx.send(i);
+            }
             let (mut ready, mut next, mut result, mut stop) = (std::collections::BTreeMap::new(), 0, Ok(()), false);
             while next < started {
-                let (i, v) = match rx.try_recv() {
-                    Ok(m) => m,
-                    Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => {
-                        // A worker of the pool runs queued frames itself while it waits.
-                        if matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
-                            continue;
-                        }
-                        match rx.recv_timeout(std::time::Duration::from_millis(2)) {
-                            Ok(m) => m,
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                };
+                let Ok((i, v)) = rx.recv() else { break };
                 stop |= v.is_none();
                 ready.insert(i, v);
                 while let Some(v) = ready.remove(&next) {
                     if let (Some(v), Ok(())) = (v, &result) {
-                        result = sink(ks[next], v);
+                        result = sink(ks.get(next).copied().unwrap_or_default(), v);
                     }
                     next += 1;
                     if result.is_ok() && !stop && started < ks.len() {
-                        start(started);
+                        let _ = jobs_tx.send(started);
                         started += 1;
                     }
                 }
             }
+            // No more frames: the threads end when the job queue closes.
+            drop(jobs_tx);
             result
         })
     }
