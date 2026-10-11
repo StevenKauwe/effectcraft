@@ -166,6 +166,15 @@ pub fn adjust_mix(e: &mut Enc, canvas: &GpuImage, adjusted: &GpuImage, matte: &G
     out
 }
 
+/// A premultiplied image over an opaque colour (alpha 1 everywhere).
+pub fn over_color(e: &mut Enc, img: &GpuImage, color: [f32; 3]) -> GpuImage {
+    let mut p = Params::default();
+    p.f[0] = [color[0], color[1], color[2], 0.0];
+    let out = e.scratch(img.width, img.height);
+    e.pixels("over_color", &p, img, None, &out, None);
+    out
+}
+
 /// Clamp and quantise to `levels` steps (8/16 bpc).
 pub fn quantize(e: &mut Enc, img: &GpuImage, levels: f32) -> GpuImage {
     // Quantising is idempotent: an image a fused kernel already quantised stays as it is.

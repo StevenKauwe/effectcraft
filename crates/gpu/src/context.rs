@@ -32,6 +32,7 @@ const ENTRIES: &[&str] = &[
     "bokeh_gather",
     "fill",
     "premultiply8",
+    "over_color",
 ];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see

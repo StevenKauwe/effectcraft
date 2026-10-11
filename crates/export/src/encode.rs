@@ -273,14 +273,13 @@ pub(crate) fn pcm_bytes(buf: &[f32], fmt: AudioFormat, big_endian: bool) -> Vec<
 /// A movie job's frames handed in order to the host's [`crate::FrameSink`] instead of encoded.
 pub(crate) async fn to_sink(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>, sink: &dyn crate::FrameSink) -> Result<Report> {
     let format = sink.format();
-    let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> {
-        let px = job.pixels(&img, comp, Channels::Rgb, w, h);
+    let render = |_: u64, px: Vec<u8>| -> Vec<u8> {
         match format {
             crate::FrameFormat::Rgba8 => px,
             crate::FrameFormat::I420 => i420(&px, w, h),
         }
     };
-    job.stream(comp, (0..st.total).collect(), 2 * batch_size() as usize, render, |k, px| {
+    job.stream_rgb8(comp, (0..st.total).collect(), 2 * batch_size() as usize, (w, h), render, |k, px| {
         sink.frame(k, &px).map_err(ExportError::Encode)?;
         st.advance(1)
     })

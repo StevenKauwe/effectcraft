@@ -284,6 +284,34 @@ fn all_blend_modes_at_every_bit_depth() {
     }
 }
 
+/// An 8-bit frame converted on the GPU ([`Gpu::render_rgba8`]) is the float frame converted on
+/// the CPU (`Image::to_rgba8_over`), over an opaque background and where the comp is empty.
+#[test]
+fn rgba8_frames_match_the_cpu_conversion() {
+    let Some(g) = gpu() else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut partly_empty = Scene::new(depth);
+        let mut l = partly_empty.footage(60, 40);
+        set(&mut l, "transform/rotation", Value::Scalar(17.0));
+        set(&mut l, "transform/opacity", Value::Scalar(70.0));
+        partly_empty.push(l);
+        for (label, s) in [("layers", blend_scene(depth, BlendMode::Normal)), ("partly empty", partly_empty)] {
+            let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+            r.accel = Some(g);
+            let bg = [0.2, 0.5, 0.8];
+            let float = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame").to_rgba8_over(bg);
+            let bytes = g.render_rgba8(&r, s.cid, Tick::ZERO, bg).expect("the GPU converts the frame");
+            assert_eq!(bytes.len(), float.len(), "{label} {depth:?}");
+            // The same arithmetic on both sides, but a shader may contract the multiply and the
+            // add, which can move a value across a rounding boundary: by one level at most.
+            let off = bytes.iter().zip(&float).filter(|(a, b)| a != b).count();
+            let worst = bytes.iter().zip(&float).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            assert!(worst <= 1 && off * 1000 <= bytes.len(), "{label} {depth:?}: {off} of {} bytes differ (worst {worst})", bytes.len());
+            assert!(bytes.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "{label} {depth:?}: opaque");
+        }
+    }
+}
+
 #[test]
 fn transforms_sampling_and_resolution() {
     for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {

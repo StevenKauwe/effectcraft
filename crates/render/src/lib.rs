@@ -275,6 +275,12 @@ pub trait Accelerator: Send + Sync {
     /// Render a top-level comp frame (what [`Renderer::comp_frame`] returns). `None` = not
     /// handled (the CPU renders it).
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image>;
+    /// [`Self::comp_frame`] as opaque 8-bit RGBA over `background` (the bytes
+    /// [`Image::to_rgba8_over`] makes of that frame), for accelerators that convert before
+    /// reading the frame back. `None` = not handled ([`Self::comp_frame`] is tried next).
+    fn comp_frame_rgba8(&self, _r: &Renderer, _comp: ItemId, _t: Tick, _background: [f32; 3]) -> Option<Vec<u8>> {
+        None
+    }
     /// The accelerator implements effect `id` with the CPU effect's semantics.
     fn supports_effect(&self, id: &str) -> bool;
     /// Run a chain of supported effects on `buf`, clamping and quantising to `levels` after
@@ -756,6 +762,27 @@ impl<'a> Renderer<'a> {
             return img;
         }
         self.comp_frame_cpu(comp_id, t)
+    }
+
+    /// [`Self::comp_frame`] as opaque 8-bit RGBA over `background`, as
+    /// [`Image::to_rgba8_over`] converts it. An accelerator that converts on the device hands
+    /// the bytes over directly; otherwise the frame is rendered and converted here.
+    pub fn comp_frame_rgba8(&self, comp_id: ItemId, t: Tick, background: [f32; 3]) -> Vec<u8> {
+        if self.depth == 0
+            && let Some(a) = self.active_accel()
+        {
+            let auto = self.frame_auto(a, comp_id, false);
+            if auto.is_none_or(|(p, key)| p.choose(key)) {
+                let t0 = web_time::Instant::now();
+                if let Some(px) = a.comp_frame_rgba8(self, comp_id, t, background) {
+                    if let Some((p, key)) = auto {
+                        p.record(key, true, t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                    return px;
+                }
+            }
+        }
+        self.comp_frame(comp_id, t).to_rgba8_over(background)
     }
 
     /// The Auto timing history and key for a top-level frame of `comp` (`None` unless the

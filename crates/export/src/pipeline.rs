@@ -75,7 +75,8 @@ impl<'a> Cx<'a> {
         self.project.comp(self.job.comp)
     }
 
-    async fn render_at(&self, t: Tick) -> Image {
+    /// The renderer for this job's frames, as the Render Settings ask.
+    fn renderer(&self) -> Renderer<'_> {
         let s = self.job.settings;
         let opts = RenderOpts {
             scale: s.resolution.clamp(0.01, 4.0),
@@ -93,8 +94,12 @@ impl<'a> Cx<'a> {
         let mut r = Renderer::new(&self.project, self.job.footage, opts);
         r.expr = self.job.expr;
         r.accel = self.job.accel;
+        r
+    }
+
+    async fn render_at(&self, t: Tick) -> Image {
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
-        effectcraft_render::passes::comp_frame(&r, self.job.comp, t).await
+        effectcraft_render::passes::comp_frame(&self.renderer(), self.job.comp, t).await
     }
 
     /// Whether frames render in passes (an accelerator with deferred readbacks).
@@ -138,6 +143,29 @@ impl<'a> Cx<'a> {
         for k in ks {
             let img = self.frame_async(comp, k).await;
             sink(k, f(k, img))?;
+        }
+        Ok(())
+    }
+
+    /// [`Cx::stream`] for encoders that take 8-bit RGB: `f` gets each frame as
+    /// [`Cx::frame_rgb8`] makes it (`w`×`h`, over the comp background).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_rgb8<T: Send, E>(
+        &self,
+        comp: &Comp,
+        ks: Vec<u64>,
+        window: usize,
+        (w, h): (u32, u32),
+        f: impl Fn(u64, Vec<u8>) -> T + Sync + Send,
+        mut sink: impl FnMut(u64, T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.deferred() {
+            return self.stream_parallel(&ks, window.max(1), &|k| f(k, self.frame_rgb8(comp, k, w, h)), &mut sink);
+        }
+        for k in ks {
+            let img = self.frame_async(comp, k).await;
+            sink(k, f(k, self.pixels(&img, comp, Channels::Rgb, w, h)))?;
         }
         Ok(())
     }
@@ -235,6 +263,40 @@ impl<'a> Cx<'a> {
             ft.lock().unwrap_or_else(|e| e.into_inner()).push((i, t0.elapsed().as_secs_f64()));
         }
         img
+    }
+
+    /// The comp time of output frame `i` when the frame is the comp frame as rendered:
+    /// progressive, at the project's colour depth, neither cropped nor resized.
+    fn as_rendered(&self, comp: &Comp, i: u64) -> Option<Tick> {
+        let (s, om) = (self.job.settings, self.job.output);
+        if self.deferred() || s.color_depth != ColorDepth::Current || om.crop.enabled || om.resize.enabled {
+            return None;
+        }
+        match s.sample(comp, i) {
+            FrameSample::Progressive(t) => Some(t),
+            FrameSample::Fields { .. } => None,
+        }
+    }
+
+    /// Output frame `i` as 8-bit RGB over the comp background, `w`×`h`: what [`Cx::pixels`]
+    /// makes of [`Cx::frame`] for [`Channels::Rgb`]. A frame that is the comp frame as rendered
+    /// comes from the renderer as 8-bit pixels (a GPU frame is converted on the device, so the
+    /// float frame never crosses to the CPU).
+    pub fn frame_rgb8(&self, comp: &Comp, i: u64, w: u32, h: u32) -> Vec<u8> {
+        let slow = || self.pixels(&self.frame(comp, i), comp, Channels::Rgb, w, h);
+        let Some(t) = self.as_rendered(comp, i) else { return slow() };
+        let t0 = Instant::now();
+        let scale = self.job.settings.resolution.clamp(0.01, 4.0);
+        let fw = ((comp.width as f64 * scale).round() as u32).max(1);
+        let fh = ((comp.height as f64 * scale).round() as u32).max(1);
+        let px = self.renderer().comp_frame_rgba8(self.job.comp, t, comp.background);
+        if px.len() != fw as usize * fh as usize * 4 {
+            return slow();
+        }
+        if let Some(ft) = &self.frame_times {
+            ft.lock().unwrap_or_else(|e| e.into_inner()).push((i, t0.elapsed().as_secs_f64()));
+        }
+        crate::fit(px, fw, fh, w, h)
     }
 
     /// Output Module ▸ Crop, then Resize.

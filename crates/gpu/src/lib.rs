@@ -212,6 +212,21 @@ impl Gpu {
         (!e.failed).then_some(out)
     }
 
+    /// [`Gpu::render`] as opaque 8-bit RGBA over `background`: the bytes
+    /// `Image::to_rgba8_over` makes of the frame, converted on the GPU, so a quarter of the
+    /// frame's floats cross to the CPU and nothing is converted there (`None` = not handled).
+    pub fn render_rgba8(&self, r: &Renderer, comp: ItemId, t: Tick, background: [f32; 3]) -> Option<Vec<u8>> {
+        if !self.ctx.can_readback() || self.ctx.deferred.is_some() {
+            return None;
+        }
+        let mut e = Enc::new(&self.ctx);
+        let img = walk::render(&mut e, r, comp, t)?;
+        let over = ops::over_color(&mut e, &img, background);
+        let texture = e.display(&over);
+        let out = e.read_texture(&texture, img.width, img.height, 4)?;
+        (!e.failed).then_some(out)
+    }
+
     /// [`Gpu::render`] with deferred readbacks: the frame's readback is keyed by comp, time and
     /// render options; until it arrives (or while layer steps still miss) the pass gets a
     /// placeholder.
@@ -261,6 +276,10 @@ impl Accelerator for Gpu {
 
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
         self.render(r, comp, t)
+    }
+
+    fn comp_frame_rgba8(&self, r: &Renderer, comp: ItemId, t: Tick, background: [f32; 3]) -> Option<Vec<u8>> {
+        self.render_rgba8(r, comp, t, background)
     }
 
     fn supports_effect(&self, id: &str) -> bool {

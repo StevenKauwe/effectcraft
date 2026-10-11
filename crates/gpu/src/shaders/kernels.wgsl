@@ -195,6 +195,20 @@ fn premultiply8(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_q(p, vec4<f32>(s.xyz * s.w, s.w), P.f[0].x, P.f[0].y);
 }
 
+// A premultiplied frame over an opaque colour: `Image::to_rgba8_over` before its rounding (the
+// `display` kernel rounds). f[0].xyz = the colour
+@compute @workgroup_size(16, 16)
+fn over_color(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let s = textureLoad(src, p, 0);
+    let k = 1.0 - clamp(s.w, 0.0, 1.0);
+    textureStore(out, p, vec4<f32>(s.xyz + P.f[0].xyz * k, 1.0));
+}
+
 fn quantize_px(s: vec4<f32>, levels: f32, inv: f32) -> vec4<f32> {
     // Use the CPU-rounded reciprocal to avoid backend-dependent division.
     let a = floor(clamp(s.w, 0.0, 1.0) * levels + 0.5) * inv;
