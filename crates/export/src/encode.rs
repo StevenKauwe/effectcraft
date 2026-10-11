@@ -117,26 +117,47 @@ pub(crate) fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u
     y.resize(w * h, 0);
     u.resize(cw * ch, 0);
     v.resize(cw * ch, 0);
+    // Every 8-bit value as a float, and times each luma weight: the per-pixel arithmetic below is
+    // the plain formula's, operation for operation, without its three divisions by 255.
+    let unit: [f32; 256] = std::array::from_fn(|i| i as f32 / 255.0);
+    let (wr, wg, wb): ([f32; 256], [f32; 256], [f32; 256]) =
+        (std::array::from_fn(|i| 0.2126 * unit[i]), std::array::from_fn(|i| 0.7152 * unit[i]), std::array::from_fn(|i| 0.0722 * unit[i]));
+    let mut acc = vec![(0f32, 0f32, 0f32); cw];
     y.chunks_mut(w * 2).zip(u.chunks_mut(cw).zip(v.chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
         let rows = yr.len() / w;
-        let mut acc = vec![(0f32, 0f32, 0f32); cw];
+        acc.fill((0.0, 0.0, 0.0));
         for dy in 0..rows {
             let src = &rgba[(cy * 2 + dy) * w * 4..][..w * 4];
-            for x in 0..w {
-                let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
-                let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                yr[dy * w + x] = (16.0 + 219.0 * l).round().clamp(1.0, 254.0) as u8;
-                let a = &mut acc[x / 2];
-                a.0 += (b - l) / 1.8556;
-                a.1 += (r - l) / 1.5748;
-                a.2 += 1.0;
+            // A chroma sample's one or two pixels of this row, summed in registers: adding each
+            // pixel to the sample in memory made every pixel wait for the one before it.
+            for ((pair, out), a) in src.chunks(8).zip(yr[dy * w..][..w].chunks_mut(2)).zip(acc.iter_mut()) {
+                let (mut cb, mut cr, mut n) = *a;
+                for (px, o) in pair.as_chunks::<4>().0.iter().zip(out) {
+                    let (r, b) = (unit[px[0] as usize], unit[px[2] as usize]);
+                    let l = wr[px[0] as usize] + wg[px[1] as usize] + wb[px[2] as usize];
+                    *o = round_u8(16.0 + 219.0 * l);
+                    cb += (b - l) / 1.8556;
+                    cr += (r - l) / 1.5748;
+                    n += 1.0;
+                }
+                *a = (cb, cr, n);
             }
         }
         for (cx, a) in acc.iter().enumerate() {
-            ur[cx] = (128.0 + 224.0 * a.0 / a.2).round().clamp(1.0, 254.0) as u8;
-            vr[cx] = (128.0 + 224.0 * a.1 / a.2).round().clamp(1.0, 254.0) as u8;
+            ur[cx] = round_u8(128.0 + 224.0 * a.0 / a.2);
+            vr[cx] = round_u8(128.0 + 224.0 * a.1 / a.2);
         }
     });
+}
+
+/// `v.round().clamp(1.0, 254.0) as u8` without the call into libm that `round` is on targets
+/// without SSE4.1, and without a branch (which half a pixel's value falls in is as good as
+/// random). Clamped first, the value is small and positive, where rounding half away from zero
+/// is truncating and adding one when a half or more was cut off.
+fn round_u8(v: f32) -> u8 {
+    let c = v.clamp(0.5, 254.5);
+    let t = c as u8;
+    (t + u8::from(c - t as f32 >= 0.5)).clamp(1, 254)
 }
 
 // ---------------------------------------------------------------- ProRes
@@ -438,6 +459,55 @@ mod tests {
         assert_eq!(y10[1], 64);
         assert_eq!(cb[0], 512);
         assert!(cr[2] > 900, "red has high Cr: {}", cr[2]);
+    }
+
+    /// The conversion is the plain BT.709 formula, value for value: greys, primaries, a spread of
+    /// colours, and odd sizes (the last column and row average fewer pixels).
+    #[test]
+    fn yuv420_matches_the_plain_formula() {
+        let plain = |rgba: &[u8], w: usize, h: usize| -> Vec<u8> {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let px = |x: usize, y: usize| {
+                let p = &rgba[(y * w + x) * 4..];
+                (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
+            };
+            let luma = |(r, g, b): (f32, f32, f32)| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let mut out: Vec<u8> = (0..w * h).map(|i| (16.0 + 219.0 * luma(px(i % w, i / w))).round().clamp(1.0, 254.0) as u8).collect();
+            for plane in 0..2 {
+                for cy in 0..ch {
+                    for cx in 0..cw {
+                        let (mut sum, mut n) = (0f32, 0f32);
+                        for y in (cy * 2..cy * 2 + 2).filter(|y| *y < h) {
+                            for x in (cx * 2..cx * 2 + 2).filter(|x| *x < w) {
+                                let (r, g, b) = px(x, y);
+                                let l = luma((r, g, b));
+                                sum += if plane == 0 { (b - l) / 1.8556 } else { (r - l) / 1.5748 };
+                                n += 1.0;
+                            }
+                        }
+                        out.push((128.0 + 224.0 * sum / n).round().clamp(1.0, 254.0) as u8);
+                    }
+                }
+            }
+            out
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for (w, h) in [(256usize, 2usize), (64, 48), (7, 5), (1, 1)] {
+            let mut rgba: Vec<u8> = (0..w * h * 4).map(|_| next()).collect();
+            // Greys and the extremes among them.
+            for (i, p) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate().take(256) {
+                p[..3].fill(i as u8);
+            }
+            let (mut y, mut u, mut v) = (vec![], vec![], vec![]);
+            rgba_to_yuv420(&rgba, w, h, &mut y, &mut u, &mut v);
+            assert_eq!([y, u, v].concat(), plain(&rgba, w, h), "{w}×{h}");
+        }
     }
 
     /// H.264 takes its frames converted on the render threads: Y, U and V one after the other,
