@@ -317,7 +317,20 @@ struct Paths {
 /// A line's points on a 1/256-pixel grid: exact in f32 at any atlas position (below 2^15
 /// pixels), so a layer's coverage does not depend on where its region is.
 fn snap(el: PathEl) -> PathEl {
-    let q = |p: Point| Point::new((p.x * 256.0).round() / 256.0, (p.y * 256.0).round() / 256.0);
+    // `round` is a call into libm on targets without SSE4.1, and this runs for every point of
+    // every shape of every frame. Coordinates are far inside the range an i64 holds, where
+    // rounding half away from zero is truncating and stepping one further when a half or more
+    // was cut off; anything else (and NaN) takes the call.
+    let round = |v: f64| {
+        if v.is_nan() || v.abs() >= 1e15 {
+            return v.round();
+        }
+        let t = v as i64 as f64;
+        let cut = v - t;
+        // No branch: which half a coordinate falls in is as good as random.
+        t + (i8::from(cut >= 0.5) - i8::from(cut <= -0.5)) as f64
+    };
+    let q = |p: Point| Point::new(round(p.x * 256.0) / 256.0, round(p.y * 256.0) / 256.0);
     match el {
         PathEl::MoveTo(p) => PathEl::MoveTo(q(p)),
         PathEl::LineTo(p) => PathEl::LineTo(q(p)),
@@ -332,7 +345,9 @@ fn paths(sc: &ShapeScene) -> Paths {
         // flattened here, in buffer pixels, finer than vello's own flattening: tiny-skia follows
         // curves to a small fraction of a pixel, and ink outlines are mostly curves.
         let to_px = affine(&d.to_px);
-        let mut path = BezPath::new();
+        // Room for the lines up front (a curve flattens to several): growing the path as it
+        // filled was a tenth of the time spent here.
+        let mut path = BezPath::with_capacity(d.paths.iter().map(|p| p.elements().len()).sum::<usize>() * 4);
         for p in &d.paths {
             if p.elements().iter().all(|el| matches!(el, PathEl::MoveTo(_) | PathEl::LineTo(_) | PathEl::ClosePath)) {
                 path.extend(p.elements().iter().map(|el| snap(to_px * *el)));
