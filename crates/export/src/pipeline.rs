@@ -9,7 +9,7 @@ use effectcraft_project::render_queue::{
 };
 use effectcraft_project::{Comp, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::{RenderOpts, Renderer};
+use effectcraft_render::{LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
@@ -24,7 +24,14 @@ pub(crate) struct Cx<'a> {
     pub frame_times: Option<Mutex<Vec<(u64, f64)>>>,
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
+    /// Processed layers that are the same from frame to frame (a still, a solid, an adjustment
+    /// layer's footprint): rendered once for the job, and uploaded once by a GPU backend, which
+    /// keys its uploads by these buffers.
+    cache: LayerCache,
 }
+
+/// Memory for a job's [`Cx::cache`]: a dozen 1080p float layers.
+const CACHE_BUDGET: usize = 384 << 20;
 
 impl<'a> std::ops::Deref for Cx<'a> {
     type Target = Job<'a>;
@@ -68,7 +75,7 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]) }
+        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]), cache: LayerCache::new(CACHE_BUDGET) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -94,6 +101,7 @@ impl<'a> Cx<'a> {
         let mut r = Renderer::new(&self.project, self.job.footage, opts);
         r.expr = self.job.expr;
         r.accel = self.job.accel;
+        r.cache = Some(&self.cache);
         r
     }
 
