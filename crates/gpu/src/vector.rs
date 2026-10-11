@@ -51,11 +51,14 @@ struct Targets {
     bytes: usize,
 }
 
-/// The vello renderer (built on first use; `None` when it could not be built on this device),
-/// the processed-layer cache and the pool of vello targets.
+/// The vello renderers, the processed-layer cache and the pool of vello targets.
 #[derive(Default)]
 pub(crate) struct State {
-    renderer: OnceLock<Option<Mutex<vello::Renderer>>>,
+    /// Whether vello renders on this device (the first renderer is built to find out).
+    usable: OnceLock<bool>,
+    /// Renderers nobody is using. A render takes one and builds another when they are all in use,
+    /// so frames rendering on several threads never queue for one renderer.
+    renderers: Mutex<Vec<vello::Renderer>>,
     cache: Mutex<Cache>,
     targets: Mutex<Targets>,
     /// How often each full content key missed the cache (see [`State::recurring`]).
@@ -160,24 +163,48 @@ impl State {
         }
     }
 
-    fn renderer(&self, device: &wgpu::Device) -> Option<&Mutex<vello::Renderer>> {
-        self.renderer
-            .get_or_init(|| {
-                let opts = vello::RendererOptions {
-                    use_cpu: false,
-                    antialiasing_support: vello::AaSupport::area_only(),
-                    num_init_threads: std::num::NonZeroUsize::new(1),
-                    pipeline_cache: None,
-                };
-                match vello::Renderer::new(device, opts) {
-                    Ok(r) => Some(Mutex::new(r)),
-                    Err(e) => {
-                        log::info!("gpu: shape layers rasterise on the CPU (vello: {e})");
-                        None
-                    }
-                }
-            })
-            .as_ref()
+    fn build(device: &wgpu::Device) -> Option<vello::Renderer> {
+        let opts = vello::RendererOptions {
+            use_cpu: false,
+            antialiasing_support: vello::AaSupport::area_only(),
+            num_init_threads: std::num::NonZeroUsize::new(1),
+            pipeline_cache: None,
+        };
+        match vello::Renderer::new(device, opts) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::info!("gpu: shape layers rasterise on the CPU (vello: {e})");
+                None
+            }
+        }
+    }
+
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<vello::Renderer>> {
+        self.renderers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether shape layers can rasterise on this device.
+    fn usable(&self, device: &wgpu::Device) -> bool {
+        *self.usable.get_or_init(|| {
+            let r = Self::build(device);
+            let ok = r.is_some();
+            self.idle().extend(r);
+            ok
+        })
+    }
+
+    /// One vello render (`None` without a renderer, or when the render failed). Renders on
+    /// different threads each use a renderer of their own.
+    fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &vello::Scene, view: &wgpu::TextureView, params: &vello::RenderParams) -> Option<()> {
+        if !self.usable(device) {
+            return None;
+        }
+        let idle = self.idle().pop();
+        let mut r = idle.or_else(|| Self::build(device))?;
+        self.renders.fetch_add(1, Ordering::Relaxed);
+        let done = r.render_to_texture(device, queue, scene, view, params);
+        self.idle().push(r);
+        done.map_err(|err| log::warn!("gpu: vello: {err}")).ok()
     }
 }
 
@@ -348,19 +375,9 @@ fn paths(sc: &ShapeScene) -> Paths {
 /// that read the atlas). A failed render marks the encoder failed: its frame is then not used.
 pub(crate) fn flush(e: &mut Enc) {
     let Some(o) = e.atlas.0.take() else { return };
-    let rendered = e.g.vector.renderer(&e.g.device).is_some_and(|renderer| {
-        let view = o.target.create_view(&Default::default());
-        let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: o.used.0, height: o.used.1, antialiasing_method: vello::AaConfig::Area };
-        let Ok(mut r) = renderer.lock() else { return false };
-        e.g.vector.renders.fetch_add(1, Ordering::Relaxed);
-        match r.render_to_texture(&e.g.device, &e.g.queue, &o.scene, &view, &params) {
-            Ok(()) => true,
-            Err(err) => {
-                log::warn!("gpu: vello: {err}");
-                false
-            }
-        }
-    });
+    let view = o.target.create_view(&Default::default());
+    let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: o.used.0, height: o.used.1, antialiasing_method: vello::AaConfig::Area };
+    let rendered = e.g.vector.render(&e.g.device, &e.g.queue, &o.scene, &view, &params).is_some();
     if !rendered {
         e.failed = true;
     }
@@ -415,7 +432,9 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
     if sc.draws.is_empty() {
         return Some(e.image(w, h));
     }
-    e.g.vector.renderer(&e.g.device)?;
+    if !e.g.vector.usable(&e.g.device) {
+        return None;
+    }
     let ps = paths(sc);
     let (src, offset) = if w <= ATLAS && h <= ATLAS && ps.segments <= ATLAS_SEGMENTS && ps.tiles <= ATLAS_TILES {
         let (x, y) = place(e, w, h, ps.segments, ps.tiles);
@@ -437,15 +456,7 @@ pub(crate) fn rasterise(e: &mut Enc, sc: &ShapeScene, levels: Option<f32>) -> Op
         let target = e.g.vector.target(&e.g.device, w, h);
         let view = target.create_view(&Default::default());
         let params = vello::RenderParams { base_color: Color::TRANSPARENT, width: w, height: h, antialiasing_method: vello::AaConfig::Area };
-        {
-            let renderer = e.g.vector.renderer(&e.g.device)?;
-            let mut r = renderer.lock().ok()?;
-            e.g.vector.renders.fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = r.render_to_texture(&e.g.device, &e.g.queue, &scene, &view, &params) {
-                log::warn!("gpu: vello: {err}");
-                return None;
-            }
-        }
+        e.g.vector.render(&e.g.device, &e.g.queue, &scene, &view, &params)?;
         e.recycle_after_submit(target.clone());
         (target, [0, 0])
     };
